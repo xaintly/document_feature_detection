@@ -144,6 +144,7 @@ def init_db(conn):
             "(run_name, status)"
         )
 
+
 def _create_index_if_missing(cursor, index_name, table_name, columns_sql):
     """Create an index only if it does not already exist (MySQL compatible)."""
     cursor.execute(
@@ -156,7 +157,8 @@ def _create_index_if_missing(cursor, index_name, table_name, columns_sql):
         cursor.execute(
             f"CREATE INDEX {index_name} ON {table_name} {columns_sql}"
         )
-		
+
+
 def get_or_create_run(conn, run_name, config, config_hash, host, model):
     with conn.cursor() as cur:
         cur.execute("SELECT run_name FROM runs WHERE run_name = %s", (run_name,))
@@ -271,7 +273,7 @@ def get_filtered_paths(conn, filter_config):
     # d = source documents table
     joins = []
     where_clauses = ["d.run_name = %s", "d.status = 'complete'"]
-    params = [from_run]
+    params = []
 
     # --- REQUIRE: INNER JOIN for each required feature ---
     for i, (feat_name, feat_value) in enumerate(require.items()):
@@ -357,6 +359,7 @@ def get_filtered_paths(conn, filter_config):
         + "\nWHERE " + " AND ".join(where_clauses)
         + "\nORDER BY d.file_path"
     )
+    params.append(from_run)
 
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -392,9 +395,10 @@ def save_chunk_result(conn, doc_id, chunk_index, raw_json_str):
 
 
 def save_document_features(conn, doc_id, features, features_config):
-    """Save only positive/non-default feature values. Skips False booleans
-    and the lowest (first) enum option. Completeness is provable via the
-    documents table (status='complete')."""
+    """Save only positive/non-default feature values. Skips False booleans,
+    the lowest (first) enum option, null text, and null integers.
+    Completeness is provable via the documents table (status='complete')."""
+										   
     with conn.cursor() as cur:
         for name, value in features.items():
             fdef = features_config.get(name, {})
@@ -409,6 +413,14 @@ def save_document_features(conn, doc_id, features, features_config):
                 default_val = fdef.get("options", [""])[0]
                 if str(value).lower().strip() == default_val.lower().strip():
                     continue
+
+            # Skip null text values
+            if ftype == "text" and (value is None or str(value).strip() == ""):
+                continue
+
+            # Skip null integer values
+            if ftype == "integer" and value is None:
+                continue
 
             cur.execute(
                 "INSERT INTO document_features (doc_id, feature_name, value_text) "
@@ -508,7 +520,7 @@ def build_prompt(features_config, text, chunk_info=None):
     """Assemble the extraction prompt from feature definitions + document."""
     parts = [
         "You are a clinical document analyst. Given the document text below, "
-        "identify whether each listed feature is present.",
+        "extract the requested features.",
         "",
         "Respond with ONLY a valid JSON object — no explanation, no markdown "
         "fencing, no commentary, no additional text whatsoever.",
@@ -523,7 +535,7 @@ def build_prompt(features_config, text, chunk_info=None):
         )
         parts.append("")
 
-    parts.append("Features to identify:")
+    parts.append("Features to extract:")
     parts.append("")
 
     for name, fdef in features_config.items():
@@ -533,6 +545,14 @@ def build_prompt(features_config, text, chunk_info=None):
         elif ftype == "enum":
             opts = ", ".join(fdef["options"])
             hint = f"respond with exactly one of: {opts}"
+        elif ftype == "text":
+            max_len = fdef.get("max_length")
+            if max_len:
+                hint = f"respond with a text string of at most {max_len} characters, or null if not found"
+            else:
+                hint = "respond with a text string, or null if not found"
+        elif ftype == "integer":
+            hint = "respond with an integer, or null if not applicable"
         else:
             hint = "respond with true or false"
 
@@ -555,6 +575,7 @@ RETRY_DELAY_SECS = 15           # wait between retries on 503 / transient errors
 RETRY_MAX_ATTEMPTS = 12         # give up after ~3 minutes of retries
 RETRY_HTTP_CODES = {502, 503}   # codes that trigger a retry
 HALT_ON_CONN_FAILURE = False    # Connection failure = exit script vs. just wait
+
 
 class LLMServerDead(Exception):
     """Raised when the LLM server is unreachable (connection refused)."""
@@ -660,8 +681,11 @@ def parse_json_response(raw):
 def merge_chunk_results(chunk_jsons, features_config):
     """Combine per-chunk extractions into a single feature dict.
 
-    - boolean: OR (any chunk True → document True)
-    - enum:    MAX by option-list position (later = stronger)
+    - boolean:  OR (any chunk True → document True)
+    - enum:     MAX by option-list position (later = stronger)
+    - text:     configurable via 'strategy': last-chunk (default),
+                first-chunk, or concatenate
+    - integer:  MAX of non-null values; null if all chunks are null
     """
     merged = {}
 
@@ -670,10 +694,14 @@ def merge_chunk_results(chunk_jsons, features_config):
         values = [cj[name] for cj in chunk_jsons if name in cj]
 
         if not values:
-            merged[name] = (
-                False if ftype == "boolean"
-                else fdef.get("options", ["unknown"])[0]
-            )
+            if ftype == "boolean":
+                merged[name] = False
+            elif ftype == "enum":
+                merged[name] = fdef.get("options", ["unknown"])[0]
+            elif ftype in ("text", "integer"):
+                merged[name] = None
+            else:
+                merged[name] = False
             continue
 
         if ftype == "boolean":
@@ -694,6 +722,36 @@ def merge_chunk_results(chunk_jsons, features_config):
                         best_idx = idx
                         best_val = fdef["options"][idx]
             merged[name] = best_val
+
+        elif ftype == "text":
+            strategy = fdef.get("strategy", "last-chunk")
+            # Filter out null / None / empty / "not found" values
+            non_empty = [
+                str(v) for v in values
+                if v is not None
+                and str(v).strip() != ""
+                and str(v).strip().lower() not in ("null", "not found", "n/a", "none")
+            ]
+            if not non_empty:
+                merged[name] = None
+            elif strategy == "first-chunk":
+                merged[name] = non_empty[0]
+            elif strategy == "concatenate":
+                merged[name] = " ".join(non_empty)
+            else:  # last-chunk (default)
+                merged[name] = non_empty[-1]
+
+        elif ftype == "integer":
+            # Parse to int, skip nulls
+            int_values = []
+            for v in values:
+                if v is None or str(v).strip().lower() in ("null", "none", "n/a", "-1"):
+                    continue
+                try:
+                    int_values.append(int(float(str(v))))
+                except (ValueError, TypeError):
+                    continue
+            merged[name] = max(int_values) if int_values else None
 
         else:
             merged[name] = values[0]
@@ -742,7 +800,12 @@ def fmt_feature_value(v):
     """Short display string for a feature value."""
     if isinstance(v, bool):
         return "Y" if v else "n"
-    return str(v)
+    if v is None:
+        return "–"
+    s = str(v)
+    if len(s) > 40:
+        return s[:37] + "..."
+    return s
 
 
 # ===========================================================================
@@ -802,7 +865,7 @@ def process_corpus(args, config):
         pending = pending[: args.limit]
         print(f"Batch limit  : {args.limit}", file=sys.stderr)
     if args.cooldown and args.cooldown > 0:
-        print(f"Cooldown     : {args.cooldown}s between documents", file=sys.stderr)												   
+        print(f"Cooldown     : {args.cooldown}s between documents", file=sys.stderr)
     print("-" * 60, file=sys.stderr)
 
     session_start = time.time()
@@ -1049,16 +1112,26 @@ examples:
             )
 
     # Validate feature definitions
+    valid_types = ("boolean", "enum", "text", "integer")
+    valid_strategies = ("first-chunk", "last-chunk", "concatenate")
     for name, fdef in config["features"].items():
         ftype = fdef.get("type", "boolean")
-        if ftype not in ("boolean", "enum"):
+        if ftype not in valid_types:
             parser.error(
-                f"Feature '{name}': unsupported type '{ftype}'. Use 'boolean' or 'enum'."
+                f"Feature '{name}': unsupported type '{ftype}'. "
+                f"Use one of: {', '.join(valid_types)}."
             )
         if ftype == "enum" and not fdef.get("options"):
             parser.error(
                 f"Feature '{name}': enum type requires an 'options' list."
             )
+        if ftype == "text":
+            strategy = fdef.get("strategy", "last-chunk")
+            if strategy not in valid_strategies:
+                parser.error(
+                    f"Feature '{name}': unsupported strategy '{strategy}'. "
+                    f"Use one of: {', '.join(valid_strategies)}."
+                )
 
     process_corpus(args, config)
 
