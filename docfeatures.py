@@ -134,8 +134,29 @@ def init_db(conn):
                     ON DELETE CASCADE
             )
         """)
+        # Indexes for filter joins on large corpora
+        _create_index_if_missing(
+            cur, "idx_df_feature_value", "document_features",
+            "(feature_name, value_text(128))"
+        )
+        _create_index_if_missing(
+            cur, "idx_doc_run_status", "documents",
+            "(run_name, status)"
+        )
 
-
+def _create_index_if_missing(cursor, index_name, table_name, columns_sql):
+    """Create an index only if it does not already exist (MySQL compatible)."""
+    cursor.execute(
+        "SELECT 1 FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() "
+        "AND table_name = %s AND index_name = %s LIMIT 1",
+        (table_name, index_name),
+    )
+    if not cursor.fetchone():
+        cursor.execute(
+            f"CREATE INDEX {index_name} ON {table_name} {columns_sql}"
+        )
+		
 def get_or_create_run(conn, run_name, config, config_hash, host, model):
     with conn.cursor() as cur:
         cur.execute("SELECT run_name FROM runs WHERE run_name = %s", (run_name,))
@@ -184,6 +205,162 @@ def get_finished_paths(conn, run_name, include_errors=False):
                 (run_name,),
             )
         return {row["file_path"] for row in cur.fetchall()}
+
+
+def validate_filter(conn, filter_config):
+    """Check that the source run exists and that referenced features are valid.
+    Returns the source run's feature config for cross-reference."""
+    from_run = filter_config.get("from_run")
+    if not from_run:
+        raise ValueError("Filter config must include 'from_run'.")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT config_yaml FROM runs WHERE run_name = %s", (from_run,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(
+                f"Filter references run '{from_run}', but it does not exist. "
+                f"Use --list-runs to see available runs."
+            )
+        source_config = yaml.safe_load(row["config_yaml"])
+        source_features = set(source_config.get("features", {}).keys())
+
+        # Validate that all referenced feature names exist in the source run
+        for section_name in ("require", "exclude"):
+            section = filter_config.get(section_name, {})
+            for feat_name in section:
+                if feat_name not in source_features:
+                    raise ValueError(
+                        f"Filter {section_name} references feature "
+                        f"'{feat_name}', but run '{from_run}' does not "
+                        f"have that feature. Available: "
+                        f"{', '.join(sorted(source_features))}"
+                    )
+
+        # Check that the source run has completed documents
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM documents "
+            "WHERE run_name=%s AND status='complete'",
+            (from_run,),
+        )
+        count = cur.fetchone()["cnt"]
+        if count == 0:
+            raise ValueError(
+                f"Run '{from_run}' has no completed documents to filter."
+            )
+
+    return source_config
+
+
+def get_filtered_paths(conn, filter_config):
+    """Build a JOIN-based query to select file_paths matching the filter.
+
+    Uses INNER JOINs for 'require' criteria and LEFT JOIN + IS NULL for
+    'exclude' criteria. Designed for corpora with hundreds of millions of
+    rows where IN (SELECT ...) subqueries would be prohibitively slow.
+
+    Returns a list of file_path strings.
+    """
+    from_run = filter_config["from_run"]
+    require = filter_config.get("require", {})
+    exclude = filter_config.get("exclude", {})
+
+    # Start building the query
+    # d = source documents table
+    joins = []
+    where_clauses = ["d.run_name = %s", "d.status = 'complete'"]
+    params = [from_run]
+
+    # --- REQUIRE: INNER JOIN for each required feature ---
+    for i, (feat_name, feat_value) in enumerate(require.items()):
+        alias = f"req{i}"
+        if isinstance(feat_value, bool) and feat_value is True:
+            # Boolean true: row must exist (we only store positive values)
+            joins.append(
+                f"INNER JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s"
+            )
+            params.append(feat_name)
+        elif isinstance(feat_value, bool) and feat_value is False:
+            # Boolean false: row must NOT exist (same as exclude)
+            joins.append(
+                f"LEFT JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s"
+            )
+            params.append(feat_name)
+            where_clauses.append(f"{alias}.id IS NULL")
+        elif isinstance(feat_value, list):
+            # Enum: row must exist with one of the listed values
+            placeholders = ", ".join(["%s"] * len(feat_value))
+            joins.append(
+                f"INNER JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s "
+                f"AND {alias}.value_text IN ({placeholders})"
+            )
+            params.append(feat_name)
+            params.extend(str(v) for v in feat_value)
+        else:
+            # Single enum value (string)
+            joins.append(
+                f"INNER JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s "
+                f"AND {alias}.value_text = %s"
+            )
+            params.append(feat_name)
+            params.append(str(feat_value))
+
+    # --- EXCLUDE: LEFT JOIN + IS NULL for each excluded feature ---
+    for i, (feat_name, feat_value) in enumerate(exclude.items()):
+        alias = f"exc{i}"
+        if isinstance(feat_value, bool) and feat_value is True:
+            # Exclude documents where this feature is true (row exists)
+            joins.append(
+                f"LEFT JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s"
+            )
+            params.append(feat_name)
+            where_clauses.append(f"{alias}.id IS NULL")
+        elif isinstance(feat_value, list):
+            # Exclude documents with any of these values
+            placeholders = ", ".join(["%s"] * len(feat_value))
+            joins.append(
+                f"LEFT JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s "
+                f"AND {alias}.value_text IN ({placeholders})"
+            )
+            params.append(feat_name)
+            params.extend(str(v) for v in feat_value)
+            where_clauses.append(f"{alias}.id IS NULL")
+        else:
+            # Exclude documents with this specific value
+            joins.append(
+                f"LEFT JOIN document_features {alias} "
+                f"ON d.doc_id = {alias}.doc_id "
+                f"AND {alias}.feature_name = %s "
+                f"AND {alias}.value_text = %s"
+            )
+            params.append(feat_name)
+            params.append(str(feat_value))
+            where_clauses.append(f"{alias}.id IS NULL")
+
+    sql = (
+        "SELECT d.file_path FROM documents d\n"
+        + "\n".join(joins)
+        + "\nWHERE " + " AND ".join(where_clauses)
+        + "\nORDER BY d.file_path"
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [row["file_path"] for row in cur.fetchall()]
 
 
 def upsert_document(conn, run_name, file_path, file_hash, file_size, total_chunks):
@@ -377,7 +554,7 @@ def build_prompt(features_config, text, chunk_info=None):
 RETRY_DELAY_SECS = 15           # wait between retries on 503 / transient errors
 RETRY_MAX_ATTEMPTS = 12         # give up after ~3 minutes of retries
 RETRY_HTTP_CODES = {502, 503}   # codes that trigger a retry
-
+HALT_ON_CONN_FAILURE = False    # Connection failure = exit script vs. just wait
 
 class LLMServerDead(Exception):
     """Raised when the LLM server is unreachable (connection refused)."""
@@ -403,9 +580,9 @@ def call_llm(host, model, prompt):
             raise KeyboardInterrupt
 
         try:
-           resp = requests.post(url, json=payload, timeout=600)
+            resp = requests.post(url, json=payload, timeout=600)
         except (requests.ConnectionError, requests.exceptions.ConnectionError) as e:
-          if attempt < RETRY_MAX_ATTEMPTS:
+          if HALT_ON_CONN_FAILURE is False and attempt < RETRY_MAX_ATTEMPTS:
               print(
                 f"  [RETRY {attempt}/{RETRY_MAX_ATTEMPTS}] "
                 f"Server returned connection error, "
@@ -414,11 +591,11 @@ def call_llm(host, model, prompt):
               )
               time.sleep(RETRY_DELAY_SECS)
               continue
-          else:
-           raise LLMServerDead(
-               f"Cannot connect to LLM server at {host} — server may be down. "
-               f"({e})"
-           ) from e
+          else:										  
+            raise LLMServerDead(
+                f"Cannot connect to LLM server at {host} — server may be down. "
+                f"({e})"
+            ) from e
 
         if resp.status_code not in RETRY_HTTP_CODES:
             break
@@ -587,18 +764,45 @@ def process_corpus(args, config):
     skip_errors = not args.retry_errors
     finished = get_finished_paths(conn, args.run_name, include_errors=skip_errors)
 
-    all_files = list(discover_files(args.corpus))
+    # --- File discovery: filter mode vs. corpus mode ---
+    filter_config = config.get("filter")
+    if filter_config:
+        validate_filter(conn, filter_config)
+        all_files = get_filtered_paths(conn, filter_config)
+        source_label = f"filter from run '{filter_config['from_run']}'"
+
+        # If --corpus is also specified, intersect with filesystem
+        if args.corpus:
+            corpus_files = set(discover_files(args.corpus))
+            all_files = [f for f in all_files if f in corpus_files]
+            source_label += f" ∩ {args.corpus}"
+    else:
+        all_files = list(discover_files(args.corpus))
+        source_label = f"{args.corpus}  ({len(all_files)} files)"
+
     pending = [f for f in all_files if f not in finished]
 
     print(f"Run          : {args.run_name}", file=sys.stderr)
     print(f"Config       : {args.config}", file=sys.stderr)
-    print(f"Corpus       : {args.corpus}  ({len(all_files)} files)", file=sys.stderr)
+    print(f"Source       : {source_label}", file=sys.stderr)
+    if filter_config:
+        fc = filter_config
+        print(f"  from_run   : {fc['from_run']}", file=sys.stderr)
+        if fc.get("require"):
+            for k, v in fc["require"].items():
+                print(f"  require    : {k} = {v}", file=sys.stderr)
+        if fc.get("exclude"):
+            for k, v in fc["exclude"].items():
+                print(f"  exclude    : {k} = {v}", file=sys.stderr)
+    print(f"Matched      : {len(all_files)}", file=sys.stderr)
     print(f"Already done : {len(finished)}", file=sys.stderr)
     print(f"Pending      : {len(pending)}", file=sys.stderr)
     print(f"LLM          : {model} @ {host}", file=sys.stderr)
     if args.limit:
         pending = pending[: args.limit]
         print(f"Batch limit  : {args.limit}", file=sys.stderr)
+    if args.cooldown and args.cooldown > 0:
+        print(f"Cooldown     : {args.cooldown}s between documents", file=sys.stderr)												   
     print("-" * 60, file=sys.stderr)
 
     session_start = time.time()
@@ -657,6 +861,10 @@ def process_corpus(args, config):
                 f"{elapsed:.1f}s)  {feat_str}",
                 file=sys.stderr,
             )
+
+            # Cooldown pause to mitigate thermal throttling on compact hardware
+            if args.cooldown and args.cooldown > 0 and not _interrupted:
+                time.sleep(args.cooldown)
 
         except LLMServerDead as e:
             elapsed = time.time() - doc_start
@@ -725,6 +933,12 @@ examples:
   # Full run (resumes automatically)
   %(prog)s -c features.yaml --corpus /data/notes/ -r lung_v1
 
+  # Filtered run — config YAML contains a 'filter' section
+  %(prog)s -c lung_details.yaml -r lung_details_v1 -n 10
+
+  # Filtered run with corpus intersection
+  %(prog)s -c lung_details.yaml --corpus /data/notes/2024/ -r lung_details_v1
+
   # Retry documents that errored
   %(prog)s -c features.yaml --corpus /data/notes/ -r lung_v1 --retry-errors
 
@@ -747,6 +961,11 @@ examples:
         "--retry-errors",
         action="store_true",
         help="Re-process documents that errored in a previous session.",
+    )
+    parser.add_argument(
+        "--cooldown", type=float, default=0, metavar="SECS",
+        help="Pause N seconds between documents to reduce thermal load. "
+             "Recommended: 3-5s for DGX Spark or similar compact hardware.",
     )
 
     # LLM overrides (take precedence over config file)
@@ -803,14 +1022,31 @@ examples:
         return
 
     # ---- processing mode ----
-    if not args.config or not args.corpus or not args.run_name:
-        parser.error("--config, --corpus, and --run-name are required for processing.")
+    if not args.config or not args.run_name:
+        parser.error("--config and --run-name are required for processing.")
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
     if "features" not in config or not config["features"]:
         parser.error("Config must contain a 'features' section with at least one feature.")
+
+    # --corpus is required unless the config has a filter section
+    has_filter = "filter" in config and config["filter"]
+    if not args.corpus and not has_filter:
+        parser.error(
+            "--corpus is required when the config does not contain a 'filter' section."
+        )
+
+    # Validate filter section if present
+    if has_filter:
+        fc = config["filter"]
+        if not fc.get("from_run"):
+            parser.error("Filter section must include 'from_run'.")
+        if not fc.get("require") and not fc.get("exclude"):
+            parser.error(
+                "Filter section must include at least one 'require' or 'exclude' entry."
+            )
 
     # Validate feature definitions
     for name, fdef in config["features"].items():
