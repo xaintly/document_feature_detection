@@ -97,7 +97,7 @@ def init_db(conn):
             CREATE TABLE IF NOT EXISTS documents (
                 doc_id          INT AUTO_INCREMENT PRIMARY KEY,
                 run_name        VARCHAR(64) NOT NULL,
-                file_path       VARCHAR(255) NOT NULL,
+                file_path       VARCHAR(256) NOT NULL,
                 file_hash       CHAR(64),
                 file_size_bytes INT,
                 total_chunks    INT DEFAULT 1,
@@ -215,9 +215,25 @@ def save_chunk_result(conn, doc_id, chunk_index, raw_json_str):
         )
 
 
-def save_document_features(conn, doc_id, features):
+def save_document_features(conn, doc_id, features, features_config):
+    """Save only positive/non-default feature values. Skips False booleans
+    and the lowest (first) enum option. Completeness is provable via the
+    documents table (status='complete')."""
     with conn.cursor() as cur:
         for name, value in features.items():
+            fdef = features_config.get(name, {})
+            ftype = fdef.get("type", "boolean")
+
+            # Skip false booleans
+            if ftype == "boolean" and value is False:
+                continue
+
+            # Skip the default (first/lowest) enum value
+            if ftype == "enum":
+                default_val = fdef.get("options", [""])[0]
+                if str(value).lower().strip() == default_val.lower().strip():
+                    continue
+
             cur.execute(
                 "INSERT INTO document_features (doc_id, feature_name, value_text) "
                 "VALUES (%s,%s,%s) "
@@ -568,7 +584,7 @@ def process_corpus(args, config):
                 break
 
             merged = merge_chunk_results(chunk_results_list, features_config)
-            save_document_features(conn, doc_id, merged)
+            save_document_features(conn, doc_id, merged, features_config)
 
             elapsed = time.time() - doc_start
             mark_document(conn, doc_id, "complete", elapsed=elapsed)
@@ -747,4 +763,3 @@ examples:
 
 if __name__ == "__main__":
     main()
-
