@@ -36,10 +36,9 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# CHUNK_TARGET_CHARS = 40_000  # ~10k tokens
-CHUNK_TARGET_CHARS = 400_000  # ~100k tokens
-DEFAULT_LLM_HOST = "http://localhost:8080"
-DEFAULT_LLM_MODEL = "default"
+CHUNK_TARGET_CHARS = 400_000  # ~10k tokens
+DEFAULT_LLM_HOST = "http://192.168.86.33:11433"
+DEFAULT_LLM_MODEL = "qwen3.5:35b"
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
 
 # ---------------------------------------------------------------------------
@@ -374,15 +373,72 @@ def build_prompt(features_config, text, chunk_info=None):
 # LLM Interaction
 # ===========================================================================
 
+# Retry configuration
+RETRY_DELAY_SECS = 15           # wait between retries on 503 / transient errors
+RETRY_MAX_ATTEMPTS = 12         # give up after ~3 minutes of retries
+RETRY_HTTP_CODES = {502, 503}   # codes that trigger a retry
+
+
+class LLMServerDead(Exception):
+    """Raised when the LLM server is unreachable (connection refused)."""
+    pass
+
+
 def call_llm(host, model, prompt):
-    """Send prompt to llama-server (OpenAI-compatible chat completions)."""
+    """Send prompt to llama-server with retry on transient errors.
+
+    - 502/503: server restarting → retry up to RETRY_MAX_ATTEMPTS
+    - ConnectionError: server dead → raise LLMServerDead immediately
+    - Other HTTP errors: raise normally (per-document error)
+    """
     url = f"{host.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
-    resp = requests.post(url, json=payload, timeout=600)
+
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        if _interrupted:
+            raise KeyboardInterrupt
+
+        try:
+           resp = requests.post(url, json=payload, timeout=600)
+        except (requests.ConnectionError, requests.exceptions.ConnectionError) as e:
+          if attempt < RETRY_MAX_ATTEMPTS:
+              print(
+                f"  [RETRY {attempt}/{RETRY_MAX_ATTEMPTS}] "
+                f"Server returned connection error, "
+                f"waiting {RETRY_DELAY_SECS}s...",
+                file=sys.stderr,
+              )
+              time.sleep(RETRY_DELAY_SECS)
+              continue
+          else:
+           raise LLMServerDead(
+               f"Cannot connect to LLM server at {host} — server may be down. "
+               f"({e})"
+           ) from e
+
+        if resp.status_code not in RETRY_HTTP_CODES:
+            break
+
+        # Transient error — wait and retry
+        if attempt < RETRY_MAX_ATTEMPTS:
+            print(
+                f"  [RETRY {attempt}/{RETRY_MAX_ATTEMPTS}] "
+                f"Server returned {resp.status_code}, "
+                f"waiting {RETRY_DELAY_SECS}s...",
+                file=sys.stderr,
+            )
+            time.sleep(RETRY_DELAY_SECS)
+        else:
+            raise LLMServerDead(
+                f"Server returned {resp.status_code} after "
+                f"{RETRY_MAX_ATTEMPTS} retries (~{RETRY_MAX_ATTEMPTS * RETRY_DELAY_SECS}s). "
+                f"Halting run."
+            )
+
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -601,6 +657,16 @@ def process_corpus(args, config):
                 f"{elapsed:.1f}s)  {feat_str}",
                 file=sys.stderr,
             )
+
+        except LLMServerDead as e:
+            elapsed = time.time() - doc_start
+            errors += 1
+            if doc_id:
+                mark_document(conn, doc_id, "error", elapsed=elapsed, error=str(e))
+            print(f"\n  [FATAL] {e}", file=sys.stderr)
+            print("  Halting run. Resume with the same --run-name once "
+                  "the server is back.", file=sys.stderr)
+            break
 
         except Exception as e:
             elapsed = time.time() - doc_start
