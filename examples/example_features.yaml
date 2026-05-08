@@ -1,0 +1,144 @@
+# ============================================================================
+# docfeatures — Feature Definition Config
+# ============================================================================
+# One config file per research question. Each feature is something you want
+# to detect in every document. Edit the features below for your use case,
+# then run:
+#
+#   python docfeatures.py -c this_file.yaml --corpus /data/notes/ -r my_run_v1 -n 10
+#
+# Supported feature types:
+#
+#   boolean  — Is this present?  (true / false)
+#              Chunks merge with OR: if ANY chunk says true, the doc is true.
+#
+#   enum     — Which category?   (exactly one of the listed options)
+#              Options are ordered weakest → strongest. Chunks merge by
+#              taking the strongest (rightmost) value found in any chunk.
+#              Example: [none, possible, probable, definite]
+#                       "possible" in chunk 1 + "definite" in chunk 3 → "definite"
+#
+#   text     — Free text extraction (names, summaries, descriptions).
+#              Null/empty/"not found" values are not stored.
+#              For chunked documents, set 'strategy' to control merging:
+#                first-chunk   — use the first non-empty value found
+#                last-chunk    — use the last non-empty value found (default)
+#                concatenate   — join all non-empty values with spaces
+#              Optional: 'max_length' gives the LLM a character limit hint.
+#              Note: value_text column is VARCHAR(1024). Keep summaries
+#              concise, or alter the column if longer output is needed.
+#
+#   integer  — Numeric extraction (counts, measurements).
+#              Null means "not applicable / not examined."
+#              Chunks merge by taking the MAX non-null value.
+#              Use with caution: LLMs are unreliable counters. Best used
+#              as triage approximations, not precise measurements.
+#
+# Tips:
+#   - Be specific in descriptions. Name the phrases, signs, and synonyms
+#     the LLM should look for. The model has medical knowledge but benefits
+#     from explicit guidance on what counts.
+#   - Start with 3-5 features. You can always add more in a later run.
+#   - Test on 10 docs (--limit 10), check the results, tweak, repeat.
+#
+# Storage:
+#   Only positive/non-default values are stored in document_features.
+#   False booleans, the first (lowest) enum option, null text, and null
+#   integers are omitted. A document with status='complete' and no
+#   feature rows means all features were negative/default/null.
+#   Query examples:
+#
+#     -- Documents WITH pneumothorax:
+#     SELECT d.file_path FROM documents d
+#       JOIN document_features f ON d.doc_id = f.doc_id
+#       WHERE d.run_name = 'v1' AND f.feature_name = 'pneumothorax';
+#
+#     -- Documents WITHOUT pneumothorax:
+#     SELECT d.file_path FROM documents d
+#       WHERE d.run_name = 'v1' AND d.status = 'complete'
+#         AND d.doc_id NOT IN (
+#           SELECT doc_id FROM document_features
+#           WHERE feature_name = 'pneumothorax');
+# ============================================================================
+
+run_description: "Radiology report lung findings — example config"
+
+# Optional: set defaults here so you don't need CLI flags every time.
+# CLI flags (--host, --model) override these if provided.
+llm:
+  host: "http://localhost:8080"
+  model: "default"
+
+features:
+
+  lung_consolidation:
+    type: boolean
+    description: >
+      Consolidation or airspace opacity in the lungs. Look for: air
+      bronchograms, lobar or segmental opacification, alveolar filling
+      pattern, or explicit use of the word "consolidation."
+
+  pleural_effusion:
+    type: boolean
+    description: >
+      Any fluid in the pleural space. Includes: trace effusion, small/
+      moderate/large effusion, layering fluid, hemothorax, empyema.
+      Also count mentions of blunted costophrenic angle if attributed
+      to fluid.
+
+  pneumothorax:
+    type: boolean
+    description: >
+      Air in the pleural space. Includes: pneumothorax of any size,
+      tension pneumothorax, hydropneumothorax, or "small apical
+      pneumothorax."
+
+  malignancy_likelihood:
+    type: enum
+    options: [none, possible, probable, definite]
+    description: >
+      Overall suspicion for malignancy based on the report language.
+      "none"     — no mention of suspicious findings.
+      "possible" — hedging language like "cannot exclude," "low
+                   suspicion," or incidental nodules without concern.
+      "probable" — moderate suspicion, recommendation for biopsy or
+                   PET, growing nodule, spiculated mass.
+      "definite" — biopsy-proven, known primary, or unequivocal
+                   language like "consistent with malignancy."
+
+  laterality:
+    type: enum
+    options: [unspecified, left, right, bilateral]
+    description: >
+      Side of the primary finding. If multiple findings exist, report
+      the side of the most clinically significant one. Use "bilateral"
+      if the primary finding is bilateral. Use "unspecified" if the
+      report does not clearly lateralize.
+
+  # --- Text features ---
+
+  document_summary:
+    type: text
+    strategy: last-chunk
+    max_length: 200
+    description: >
+      One to two sentence summary of the primary findings in this
+      document. Focus on clinically significant findings only.
+
+  signing_radiologist:
+    type: text
+    strategy: first-chunk
+    description: >
+      Full name of the signing or attending radiologist as it
+      appears in the document. If no radiologist name is present,
+      respond with null.
+
+  # --- Integer features (use with caution) ---
+
+  # enlarged_node_count:
+  #   type: integer
+  #   description: >
+  #     Number of enlarged lymph nodes identified in the report.
+  #     Respond with the count (0 or more) if nodes were assessed.
+  #     Respond with null if lymph nodes were not examined or
+  #     not mentioned in this document.

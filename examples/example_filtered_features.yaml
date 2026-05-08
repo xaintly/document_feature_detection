@@ -1,0 +1,104 @@
+# ============================================================================
+# docfeatures — Filtered Feature Extraction Config (Example)
+# ============================================================================
+# This config filters documents from a previous run and extracts additional
+# detail features from the matching subset.
+#
+# Workflow:
+#   1. Run a broad feature scan:
+#      python docfeatures.py -c lung_broad.yaml --corpus /data/rad/ -r lung_v3
+#
+#   2. Run this filtered detail extraction on the hits:
+#      python docfeatures.py -c lung_details.yaml -r lung_details_v1 -n 10
+#
+#   3. Once satisfied, run without --limit:
+#      python docfeatures.py -c lung_details.yaml -r lung_details_v1
+#
+#   4. Query combined results in MySQL:
+#      SELECT d1.file_path,
+#             broad.feature_name  AS broad_feature,
+#             broad.value_text    AS broad_value,
+#             detail.feature_name AS detail_feature,
+#             detail.value_text   AS detail_value
+#      FROM documents d1
+#      JOIN document_features broad  ON d1.doc_id = broad.doc_id
+#      JOIN documents d2             ON d1.file_path = d2.file_path
+#      JOIN document_features detail ON d2.doc_id = detail.doc_id
+#      WHERE d1.run_name = 'lung_v3'
+#        AND d2.run_name = 'lung_details_v1';
+#
+# Filter logic:
+#   require:
+#     feature_name: true          # document must have this feature (boolean)
+#     feature_name: [val1, val2]  # document must have one of these values (enum)
+#     feature_name: false         # document must NOT have this feature
+#
+#   exclude:
+#     feature_name: true          # skip documents that have this feature
+#     feature_name: [val1, val2]  # skip documents with any of these values
+#
+#   Omitting a feature from both require and exclude means "don't care."
+#
+# Note: --corpus is optional with a filter. If provided, results are
+#       intersected (document must match filter AND be in the corpus path).
+# ============================================================================
+
+run_description: "Detailed consolidation findings for cases with lung consolidation and possible/probable/definite malignancy"
+
+llm:
+  host: "http://localhost:11434"
+  model: "qwen3.5-35b-long"
+
+# Filter: select documents from a previous run
+filter:
+  from_run: "lung_v3"
+  require:
+    lung_consolidation: true
+    malignancy_likelihood: [probable, definite]
+  exclude:
+    pneumothorax: true
+
+# New features to extract from the filtered documents
+features:
+
+  consolidation_location:
+    type: enum
+    options: [upper_lobe, middle_lobe, lower_lobe, multilobar, unspecified]
+    description: >
+      Primary anatomical location of the consolidation finding.
+      If multiple locations are mentioned, report the most clinically
+      significant one. Use "multilobar" if consolidation spans
+      multiple lobes.
+
+  consolidation_pattern:
+    type: enum
+    options: [lobar, segmental, patchy, diffuse, unspecified]
+    description: >
+      Pattern or distribution of the consolidation. "lobar" for
+      complete lobe involvement, "segmental" for a single segment,
+      "patchy" for scattered or multifocal opacities, "diffuse"
+      for widespread bilateral involvement.
+
+  air_bronchograms_present:
+    type: boolean
+    description: >
+      Whether air bronchograms are explicitly mentioned in the report.
+      Look for: "air bronchograms," "air bronchogram sign," or
+      description of air-filled bronchi visible within consolidated lung.
+
+  associated_pleural_effusion:
+    type: boolean
+    description: >
+      Whether a pleural effusion is mentioned in association with
+      the consolidation, on the same side.
+
+  malignancy_basis:
+    type: enum
+    options: [imaging_only, biopsy_pending, biopsy_confirmed, clinical_history, unspecified]
+    description: >
+      Basis for the malignancy assessment.
+      "imaging_only"     — suspicion based on imaging features alone.
+      "biopsy_pending"   — biopsy recommended or scheduled.
+      "biopsy_confirmed" — pathology results confirm malignancy.
+      "clinical_history" — suspicion based on known cancer history.
+      "unspecified"      — report suggests malignancy but basis unclear.
