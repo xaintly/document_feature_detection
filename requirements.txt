@@ -1,0 +1,5 @@
+pymysql
+pyyaml
+requests
+python-dotenv
+flask

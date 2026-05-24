@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docfeatures — Search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css" rel="stylesheet">
+<style>
+:root {
+  --df-bg: #f4f6f8;
+  --df-sidebar: #1e293b;
+  --df-sidebar-text: #cbd5e1;
+  --df-sidebar-hover: #334155;
+  --df-accent: #3b82f6;
+  --df-accent-dark: #2563eb;
+  --df-badge-bool: #059669;
+  --df-badge-enum: #7c3aed;
+  --df-badge-text: #0369a1;
+  --df-badge-int: #b45309;
+  --df-border: #e2e8f0;
+  --df-muted: #64748b;
+}
+* { font-family: 'IBM Plex Sans', system-ui, sans-serif; }
+code, pre, .mono { font-family: 'IBM Plex Mono', monospace; }
+body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
+
+/* --- Sidebar --- */
+.sidebar {
+  width: 300px; min-width: 300px; max-height: 100vh; overflow-y: auto;
+  background: var(--df-sidebar); color: var(--df-sidebar-text);
+  padding: 1.25rem; display: flex; flex-direction: column;
+  position: sticky; top: 0;
+}
+.sidebar h1 { font-size: 1.1rem; font-weight: 600; color: #fff; margin-bottom: .25rem; }
+.sidebar .subtitle { font-size: .75rem; color: var(--df-muted); margin-bottom: 1.25rem; }
+.sidebar h2 { font-size: .75rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--df-muted); margin: 1rem 0 .5rem; }
+.run-item {
+  padding: .5rem .6rem; border-radius: 6px; cursor: pointer;
+  margin-bottom: 2px; display: flex; align-items: flex-start; gap: .5rem;
+  transition: background .15s;
+}
+.run-item:hover { background: var(--df-sidebar-hover); }
+.run-item input[type="checkbox"] { margin-top: 3px; accent-color: var(--df-accent); }
+.run-item .run-name { font-size: .85rem; font-weight: 500; color: #e2e8f0; }
+.run-item .run-meta { font-size: .7rem; color: var(--df-muted); }
+.run-item .run-desc { font-size: .72rem; color: #94a3b8; margin-top: 1px; }
+.run-child { font-size: .65rem; color: var(--df-muted); opacity: .8; }
+
+/* --- Main --- */
+.main { flex: 1; padding: 1.5rem 2rem; max-width: 1200px; overflow-y: auto; }
+.main h2 { font-size: 1rem; font-weight: 600; color: #1e293b; margin-bottom: .75rem; }
+.filter-empty { color: var(--df-muted); font-size: .85rem; font-style: italic; }
+
+/* --- Filter widgets --- */
+.filter-card {
+  background: #fff; border: 1px solid var(--df-border); border-radius: 8px;
+  padding: .75rem 1rem; margin-bottom: .5rem;
+}
+.filter-card .filter-label {
+  font-size: .8rem; font-weight: 600; color: #334155; margin-bottom: .35rem;
+}
+.filter-card .filter-desc {
+  font-size: .7rem; color: var(--df-muted); margin-bottom: .4rem;
+  max-height: 2.8em; overflow: hidden;
+}
+.filter-card .filter-controls { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+.filter-card .filter-controls label {
+  font-size: .78rem; display: flex; align-items: center; gap: .25rem; cursor: pointer;
+}
+.filter-card .filter-controls input[type="text"],
+.filter-card .filter-controls input[type="number"] {
+  font-size: .8rem; padding: .2rem .5rem; border: 1px solid var(--df-border);
+  border-radius: 4px; width: 120px;
+}
+.filter-type-tag {
+  font-size: .6rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .05em; padding: .1rem .35rem; border-radius: 3px;
+  display: inline-block; margin-left: .4rem; vertical-align: middle;
+}
+.tag-boolean { background: #d1fae5; color: #065f46; }
+.tag-enum { background: #ede9fe; color: #5b21b6; }
+.tag-text { background: #e0f2fe; color: #075985; }
+.tag-integer { background: #fef3c7; color: #92400e; }
+
+/* --- Toolbar --- */
+.toolbar {
+  display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
+  margin-bottom: 1rem; padding: .5rem 0;
+}
+.toolbar .btn { font-size: .8rem; }
+.page-size-select { font-size: .8rem; padding: .25rem .4rem; border: 1px solid var(--df-border); border-radius: 4px; }
+.result-stats { font-size: .8rem; color: var(--df-muted); }
+
+/* --- Results table --- */
+.results-table {
+  width: 100%; background: #fff; border: 1px solid var(--df-border);
+  border-radius: 8px; border-spacing: 0; overflow: hidden;
+  font-size: .82rem;
+}
+.results-table thead th {
+  background: #f8fafc; border-bottom: 2px solid var(--df-border);
+  padding: .5rem .75rem; text-align: left; font-weight: 600; font-size: .75rem;
+  color: var(--df-muted); text-transform: uppercase; letter-spacing: .04em;
+  position: sticky; top: 0;
+}
+.results-table tbody tr { cursor: pointer; transition: background .1s; }
+.results-table tbody tr:hover { background: #f0f7ff; }
+.results-table tbody td {
+  padding: .5rem .75rem; border-bottom: 1px solid var(--df-border);
+  vertical-align: top;
+}
+.results-table .cell-path { max-width: 280px; word-break: break-all; font-size: .78rem; }
+.results-table .cell-run { font-size: .72rem; color: var(--df-muted); white-space: nowrap; }
+
+/* --- Feature badges --- */
+.feature-badges { display: flex; flex-wrap: wrap; gap: 3px; }
+.fbadge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: .15rem .45rem; border-radius: 10px; font-size: .7rem;
+  font-weight: 500; line-height: 1.3; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fbadge-bool { background: #d1fae5; color: #065f46; }
+.fbadge-enum { background: #ede9fe; color: #5b21b6; }
+.fbadge-text { background: #e0f2fe; color: #075985; }
+.fbadge-int  { background: #fef3c7; color: #92400e; }
+.fbadge .fbadge-val { font-weight: 400; opacity: .85; }
+
+/* --- Pagination --- */
+.pagination-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: .75rem; font-size: .8rem; color: var(--df-muted);
+}
+.pagination-bar button {
+  font-size: .78rem; padding: .25rem .6rem; border: 1px solid var(--df-border);
+  border-radius: 4px; background: #fff; cursor: pointer;
+}
+.pagination-bar button:disabled { opacity: .4; cursor: default; }
+.pagination-bar button:hover:not(:disabled) { background: #f0f4f8; }
+.page-nums { display: flex; gap: 2px; }
+.page-nums button.active { background: var(--df-accent); color: #fff; border-color: var(--df-accent); }
+
+/* --- Preview modal --- */
+.modal-xl-custom { max-width: 900px; }
+.preview-features {
+  background: #f8fafc; border-bottom: 1px solid var(--df-border);
+  padding: .75rem 1rem; max-height: 180px; overflow-y: auto;
+}
+.preview-features h6 {
+  font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  color: var(--df-muted); letter-spacing: .05em; margin-bottom: .4rem;
+}
+.preview-content {
+  padding: 1rem; max-height: 65vh; overflow-y: auto;
+}
+.preview-content pre {
+  white-space: pre-wrap; word-wrap: break-word; font-size: .82rem;
+  line-height: 1.55; margin: 0;
+}
+.preview-content iframe { border: none; width: 100%; height: 60vh; }
+
+/* --- SQL modal --- */
+.sql-display { font-size: .8rem; white-space: pre-wrap; background: #1e293b;
+  color: #e2e8f0; padding: 1rem; border-radius: 6px; }
+
+/* --- Misc --- */
+.empty-state { text-align: center; padding: 3rem; color: var(--df-muted); }
+.empty-state .icon { font-size: 2.5rem; margin-bottom: .5rem; }
+.spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid var(--df-border);
+  border-top-color: var(--df-accent); border-radius: 50%; animation: spin .6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<!-- Sidebar: Run Selector -->
+<aside class="sidebar" id="sidebar">
+  <h1>docfeatures</h1>
+  <div class="subtitle">Document Feature Search</div>
+  <h2>Select Runs</h2>
+  <div id="runList">
+    <div style="padding:1rem;color:var(--df-muted);font-size:.8rem">Loading runs...</div>
+  </div>
+</aside>
+
+<!-- Main Content -->
+<div class="main">
+  <!-- Filters -->
+  <h2>Filters</h2>
+  <div id="filterArea">
+    <div class="filter-empty">Select one or more runs to see available filters.</div>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="toolbar" id="toolbar" style="display:none">
+    <button class="btn btn-primary btn-sm" onclick="doSearch(1)">
+      Search
+    </button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="clearFilters()">
+      Clear Filters
+    </button>
+    <div style="flex:1"></div>
+    <label style="font-size:.78rem;color:var(--df-muted)">
+      Page size:
+      <select class="page-size-select" id="pageSize" onchange="doSearch(1)">
+        <option value="25" selected>25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+    </label>
+    <button class="btn btn-outline-secondary btn-sm" onclick="exportCSV()">
+      ↓ CSV
+    </button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="showSQL()">
+      { } SQL
+    </button>
+  </div>
+
+  <!-- Results -->
+  <div id="resultsArea">
+    <div class="empty-state">
+      <div class="icon">🔍</div>
+      <div>Select runs and search to view results.</div>
+    </div>
+  </div>
+</div>
+
+<!-- Document Preview Modal -->
+<div class="modal fade" id="previewModal" tabindex="-1">
+  <div class="modal-dialog modal-xl-custom modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title mono" id="previewTitle" style="font-size:.85rem"></h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="preview-features" id="previewFeatures"></div>
+      <div class="preview-content" id="previewContent">
+        <div style="text-align:center;padding:2rem"><div class="spinner"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SQL Modal -->
+<div class="modal fade" id="sqlModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title" style="font-size:.85rem">Generated SQL</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <pre class="sql-display" id="sqlDisplay"></pre>
+        <button class="btn btn-sm btn-outline-secondary mt-2" onclick="copySQL()">Copy</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
+<script>
+// =======================================================================
+// State
+// =======================================================================
+let allRuns = [];
+let mergedFeatures = {};   // feature_name -> {type, options, description}
+let lastSearchPayload = null;
+let lastSQL = '';
+let currentPage = 1;
+
+// =======================================================================
+// Init
+// =======================================================================
+document.addEventListener('DOMContentLoaded', loadRuns);
+
+async function loadRuns() {
+  try {
+    const resp = await fetch('/api/runs');
+    allRuns = await resp.json();
+    renderRunList();
+  } catch (e) {
+    document.getElementById('runList').innerHTML =
+      '<div style="color:#ef4444;font-size:.8rem">Failed to load runs.</div>';
+  }
+}
+
+// =======================================================================
+// Run list
+// =======================================================================
+function renderRunList() {
+  const el = document.getElementById('runList');
+  if (!allRuns.length) {
+    el.innerHTML = '<div style="color:var(--df-muted);font-size:.8rem">No runs found.</div>';
+    return;
+  }
+  el.innerHTML = allRuns.map(r => {
+    const child = r.has_filter ? `<div class="run-child">↳ filtered from ${r.filter_from}</div>` : '';
+    return `
+    <label class="run-item">
+      <input type="checkbox" value="${esc(r.run_name)}" onchange="onRunSelectionChanged()">
+      <div>
+        <div class="run-name">${esc(r.run_name)}</div>
+        <div class="run-meta">${r.completed.toLocaleString()} docs · ${r.model}</div>
+        ${r.description ? `<div class="run-desc">${esc(r.description.substring(0, 100))}</div>` : ''}
+        ${child}
+      </div>
+    </label>`;
+  }).join('');
+}
+
+function getSelectedRuns() {
+  return Array.from(document.querySelectorAll('#runList input:checked')).map(i => i.value);
+}
+
+function onRunSelectionChanged() {
+  const runs = getSelectedRuns();
+  mergedFeatures = {};
+  runs.forEach(rn => {
+    const run = allRuns.find(r => r.run_name === rn);
+    if (!run) return;
+    Object.entries(run.features).forEach(([fn, fdef]) => {
+      if (!mergedFeatures[fn]) {
+        mergedFeatures[fn] = { ...fdef };
+      } else if (fdef.type === 'enum') {
+        // Merge options lists
+        const existing = new Set(mergedFeatures[fn].options || []);
+        (fdef.options || []).forEach(o => existing.add(o));
+        mergedFeatures[fn].options = Array.from(existing);
+      }
+    });
+  });
+  renderFilters();
+  document.getElementById('toolbar').style.display = runs.length ? 'flex' : 'none';
+}
+
+// =======================================================================
+// Filters
+// =======================================================================
+function renderFilters() {
+  const area = document.getElementById('filterArea');
+  const entries = Object.entries(mergedFeatures);
+  if (!entries.length) {
+    area.innerHTML = '<div class="filter-empty">Select one or more runs to see available filters.</div>';
+    return;
+  }
+  area.innerHTML = entries.map(([fn, fd]) => {
+    const typeTag = `<span class="filter-type-tag tag-${fd.type}">${fd.type}</span>`;
+    let controls = '';
+
+    if (fd.type === 'boolean') {
+      controls = `
+        <label><input type="radio" name="filter_${fn}" value="any" checked> Any</label>
+        <label><input type="radio" name="filter_${fn}" value="present"> Present</label>
+        <label><input type="radio" name="filter_${fn}" value="absent"> Absent</label>`;
+    } else if (fd.type === 'enum') {
+      controls = (fd.options || []).map(o =>
+        `<label><input type="checkbox" data-feature="${esc(fn)}" data-enum-val="${esc((o == fd.options[0]) ? 'NULL' : o)}"> ${esc(o)}</label>`
+      ).join('');
+    } else if (fd.type === 'text') {
+      controls = `<input type="text" placeholder="Search text..." data-feature="${esc(fn)}" data-text-search>`;
+    } else if (fd.type === 'integer') {
+      controls = `
+        <input type="number" placeholder="Min" data-feature="${esc(fn)}" data-int-min style="width:80px">
+        <span style="color:var(--df-muted);font-size:.78rem">to</span>
+        <input type="number" placeholder="Max" data-feature="${esc(fn)}" data-int-max style="width:80px">`;
+    }
+
+    const desc = fd.description ? fd.description.replace(/\s+/g, ' ').substring(0, 150) : '';
+    return `
+    <div class="filter-card" data-feature-name="${esc(fn)}">
+      <div class="filter-label">${esc(fn)} ${typeTag}</div>
+      ${desc ? `<div class="filter-desc">${esc(desc)}</div>` : ''}
+      <div class="filter-controls">${controls}</div>
+    </div>`;
+  }).join('');
+}
+
+function gatherFilters() {
+  const filters = [];
+  Object.entries(mergedFeatures).forEach(([fn, fd]) => {
+    if (fd.type === 'boolean') {
+      const val = document.querySelector(`input[name="filter_${fn}"]:checked`)?.value;
+      if (val === 'present') filters.push({ feature: fn, run: fd.run, mode: 'present' });
+      else if (val === 'absent') filters.push({ feature: fn, run: fd.run, mode: 'absent' });
+    } else if (fd.type === 'enum') {
+      const checked = Array.from(
+        document.querySelectorAll(`input[data-feature="${fn}"][data-enum-val]:checked`)
+      ).map(i => i.dataset.enumVal);
+      if (checked.length) filters.push({ feature: fn, run: fd.run, mode: 'enum_any', values: checked });
+    } else if (fd.type === 'text') {
+      const input = document.querySelector(`input[data-feature="${fn}"][data-text-search]`);
+      if (input?.value.trim()) filters.push({ feature: fn, run: fd.run, mode: 'text_search', search: input.value.trim() });
+    } else if (fd.type === 'integer') {
+      const minEl = document.querySelector(`input[data-feature="${fn}"][data-int-min]`);
+      const maxEl = document.querySelector(`input[data-feature="${fn}"][data-int-max]`);
+      const minV = minEl?.value !== '' ? parseInt(minEl.value) : null;
+      const maxV = maxEl?.value !== '' ? parseInt(maxEl.value) : null;
+      if (minV !== null || maxV !== null) {
+        filters.push({ feature: fn, run: fd.run, mode: 'int_range', min: minV, max: maxV });
+      }
+    }
+  });
+  return filters;
+}
+
+function clearFilters() {
+  document.querySelectorAll('.filter-card input[type="radio"][value="any"]').forEach(r => r.checked = true);
+  document.querySelectorAll('.filter-card input[type="checkbox"]').forEach(c => c.checked = false);
+  document.querySelectorAll('.filter-card input[type="text"], .filter-card input[type="number"]').forEach(i => i.value = '');
+}
+
+// =======================================================================
+// Search
+// =======================================================================
+async function doSearch(page) {
+  const runs = getSelectedRuns();
+  if (!runs.length) return;
+
+  currentPage = page || 1;
+  const pageSize = parseInt(document.getElementById('pageSize').value) || 25;
+  const filters = gatherFilters();
+
+  lastSearchPayload = { runs, filters, page: currentPage, page_size: pageSize };
+
+  const area = document.getElementById('resultsArea');
+  area.innerHTML = '<div style="text-align:center;padding:2rem"><div class="spinner"></div> Searching...</div>';
+
+  try {
+    const resp = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(lastSearchPayload),
+    });
+    const data = await resp.json();
+    if (data.error) { area.innerHTML = `<div class="empty-state">${esc(data.error)}</div>`; return; }
+
+    lastSQL = data.sql || '';
+    renderResults(data);
+  } catch (e) {
+    area.innerHTML = '<div class="empty-state" style="color:#ef4444">Search failed.</div>';
+  }
+}
+
+// =======================================================================
+// Results rendering
+// =======================================================================
+function renderResults(data) {
+  const area = document.getElementById('resultsArea');
+  if (!data.results.length) {
+    area.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">📄</div>
+        <div>No documents matched your filters.</div>
+        <div style="font-size:.78rem;margin-top:.25rem">${data.total} total in selected runs</div>
+      </div>`;
+    return;
+  }
+
+  const configs = data.feature_configs || {};
+
+  const rows = data.results.map(r => {
+    const badges = (r.features || []).map(f => badgeHTML(f.name, f.value, configs[f.name])).join('');
+    const size = r.file_size ? `<span style="color:var(--df-muted);font-size:.7rem">${fmtSize(r.file_size)}</span>` : '';
+    return `
+    <tr onclick="openPreview(${r.doc_id})">
+      <td class="cell-path">${esc(r.display_path)} ${size}</td>
+      <td class="cell-run">${esc(r.run_name)}</td>
+      <td><div class="feature-badges">${badges}</div></td>
+    </tr>`;
+  }).join('');
+
+  const stats = `Showing ${((data.page - 1) * data.page_size) + 1}–${Math.min(data.page * data.page_size, data.total)} of ${data.total.toLocaleString()}`;
+
+  area.innerHTML = `
+    <div class="result-stats">${stats}</div>
+    <table class="results-table">
+      <thead><tr><th>Document</th><th>Run</th><th>Features</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${paginationHTML(data)}
+  `;
+}
+
+function badgeHTML(name, value, config) {
+  const type = config?.type || 'boolean';
+  let cls = 'fbadge-bool';
+  let display = esc(name);
+
+  if (type === 'boolean') {
+    cls = 'fbadge-bool';
+  } else if (type === 'enum') {
+    cls = 'fbadge-enum';
+    display = `${esc(name)}<span class="fbadge-val">: ${esc(value)}</span>`;
+  } else if (type === 'text') {
+    cls = 'fbadge-text';
+    const short = value && value.length > 50 ? value.substring(0, 47) + '...' : value;
+    display = `${esc(name)}<span class="fbadge-val">: ${esc(short || '?')}</span>`;
+  } else if (type === 'integer') {
+    cls = 'fbadge-int';
+    display = `${esc(name)}<span class="fbadge-val">: ${esc(value)}</span>`;
+  }
+
+  return `<span class="fbadge ${cls}" title="${esc(name)}: ${esc(value || '')}">${display}</span>`;
+}
+
+function paginationHTML(data) {
+  if (data.total_pages <= 1) return '';
+  const p = data.page;
+  const tp = data.total_pages;
+
+  // Build page number buttons (show window around current page)
+  let pages = [];
+  let start = Math.max(1, p - 3);
+  let end = Math.min(tp, p + 3);
+  if (start > 1) pages.push(1);
+  if (start > 2) pages.push('...');
+  for (let i = start; i <= end; i++) pages.push(i);
+  if (end < tp - 1) pages.push('...');
+  if (end < tp) pages.push(tp);
+
+  const nums = pages.map(pg => {
+    if (pg === '...') return '<span style="padding:0 .3rem;color:var(--df-muted)">…</span>';
+    return `<button class="${pg === p ? 'active' : ''}" onclick="doSearch(${pg})">${pg}</button>`;
+  }).join('');
+
+  return `
+  <div class="pagination-bar">
+    <button ${p <= 1 ? 'disabled' : ''} onclick="doSearch(${p - 1})">← Prev</button>
+    <div class="page-nums">${nums}</div>
+    <button ${p >= tp ? 'disabled' : ''} onclick="doSearch(${p + 1})">Next →</button>
+  </div>`;
+}
+
+// =======================================================================
+// Document Preview
+// =======================================================================
+async function openPreview(docId) {
+  const modal = new bootstrap.Modal(document.getElementById('previewModal'));
+  document.getElementById('previewTitle').textContent = 'Loading...';
+  document.getElementById('previewFeatures').innerHTML = '<div class="spinner"></div>';
+  document.getElementById('previewContent').innerHTML = '<div style="text-align:center;padding:2rem"><div class="spinner"></div></div>';
+  modal.show();
+
+  try {
+    // Fetch features and content in parallel
+    const [featResp, contentResp] = await Promise.all([
+      fetch(`/api/document/${docId}/features`),
+      fetch(`/api/document/${docId}/content`),
+    ]);
+    const featData = await featResp.json();
+    const contentData = await contentResp.json();
+
+    // Title
+    // const fname = featData.file_path ? featData.file_path.split('/').pop() : `doc ${docId}`;
+    const fname = featData.file_path ? featData.file_path : `doc ${docId}`;
+    document.getElementById('previewTitle').textContent = fname;
+
+    // Features panel
+    const summary = renderPreviewFeaturesFlat(featData);
+    const summaryHTML = summary ? '<div style="font-size: -1; font-style: italic; color: #64748b;">' + summary.value + '</div>' : null;
+
+    // Content
+    const contentEl = document.getElementById('previewContent');
+    if (contentData.error) {
+      contentEl.innerHTML = `<div style="color:#ef4444;padding:1rem">${esc(contentData.error)}</div>`;
+    } else if (contentData.content_type === 'html') {
+      const iframe = document.createElement('iframe');
+      iframe.sandbox = 'allow-same-origin';
+      if( summaryHTML ) contentData.content = contentData.content.replace(/<body.*?>/i, "$&" + summaryHTML);
+      iframe.srcdoc = contentData.content;
+      iframe.style.cssText = 'border:none;width:100%;height:60vh';
+      contentEl.innerHTML = '';
+      contentEl.appendChild(iframe);
+    } else {
+      contentEl.innerHTML = (summaryHTML ? summaryHTML + '<div><br /></div>': '') + `<pre>${esc(contentData.content)}</pre>`;
+    }
+  } catch (e) {
+    document.getElementById('previewContent').innerHTML =
+      '<div style="color:#ef4444;padding:1rem">Failed to load document.</div>';
+  }
+}
+
+function renderPreviewFeaturesFlat(data) {
+  const el = document.getElementById('previewFeatures');
+  let flat_features = [];
+  let html = '';
+
+  // This run's features
+  if (data.features?.length) flat_features.push(...data.features);
+  if (data.other_runs && Object.keys(data.other_runs).length) {
+    Object.entries(data.other_runs).forEach(([rn, feats]) => {
+      flat_features.push(...feats);
+    });
+  }
+  
+  if (flat_features.length) {
+    flat_features.sort((a,b) => a.name.localeCompare(b.name));
+    html += '<div class="feature-badges" style="margin-bottom:.5rem">';
+    html += flat_features.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
+    html += '</div>';
+  }
+
+  if (!html) html = '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
+  el.innerHTML = html;
+  
+  return flat_features.find((feature) => feature.name.match(/summary/i));
+}
+
+function renderPreviewFeatures(data) {
+  const el = document.getElementById('previewFeatures');
+  console.log(data)
+  let html = '';
+
+  // This run's features
+  if (data.features?.length) {
+    html += `<h6>${esc(data.run_name)}</h6>`;
+    html += '<div class="feature-badges" style="margin-bottom:.5rem">';
+    html += data.features.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
+    html += '</div>';
+  }
+
+  // Other runs
+  if (data.other_runs && Object.keys(data.other_runs).length) {
+    Object.entries(data.other_runs).forEach(([rn, feats]) => {
+      html += `<h6>${esc(rn)}</h6>`;
+      html += '<div class="feature-badges" style="margin-bottom:.5rem">';
+      html += feats.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
+      html += '</div>';
+    });
+  }
+
+  if (!html) html = '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
+  el.innerHTML = html;
+}
+
+// =======================================================================
+// SQL & Export
+// =======================================================================
+function showSQL() {
+  document.getElementById('sqlDisplay').textContent = lastSQL || '(no search executed yet)';
+  new bootstrap.Modal(document.getElementById('sqlModal')).show();
+}
+
+function copySQL() {
+  navigator.clipboard.writeText(lastSQL).then(() => {
+    const btn = event.target;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  });
+}
+
+async function exportCSV() {
+  if (!lastSearchPayload) return;
+  try {
+    const resp = await fetch('/api/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: lastSearchPayload.runs, filters: lastSearchPayload.filters }),
+    });
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'docfeatures_export.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Export failed.');
+  }
+}
+
+// =======================================================================
+// Utilities
+// =======================================================================
+function esc(s) {
+  if (s == null) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(0) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// Allow Enter key in filter inputs to trigger search
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.closest('.filter-card')) {
+    e.preventDefault();
+    doSearch(1);
+  }
+});
+</script>
+</body>
+</html>
