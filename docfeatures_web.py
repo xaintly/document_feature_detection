@@ -1,4 +1,4 @@
-#!/home/saintly/projects/ollama/venv/bin/python3
+#!/usr/bin/env python3
 """
 docfeatures_web.py — Web interface for searching docfeatures results.
 

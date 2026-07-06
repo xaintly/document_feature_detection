@@ -64,10 +64,17 @@
 run_description: "Radiology report lung findings — example config"
 
 # Optional: set defaults here so you don't need CLI flags every time.
-# CLI flags (--host, --model) override these if provided.
+# CLI flags (--host, --model, --corpus) override these if provided.
 llm:
   host: "http://localhost:8080"
   model: "default"
+
+# Optional: corpus paths can be specified here instead of on the command line.
+# Accepts a single path or a list. CLI --corpus overrides this entirely.
+# corpus: /data/radiology_notes/
+corpus:
+  - /data/radiology_notes/2023/
+  - /data/radiology_notes/2024/
 
 features:
 

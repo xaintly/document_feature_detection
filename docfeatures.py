@@ -36,7 +36,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHUNK_TARGET_CHARS = 400_000  # ~10k tokens
+# Chunk target: ~128k token context minus prompt/output overhead.
+# At ~3 chars/token for clinical text, 350k chars ≈ 117k tokens,
+# leaving room for the prompt (~1k tokens) and response (~500 tokens).
+# Override with --chunk-size if your model has a different context window.
+CHUNK_TARGET_CHARS = 350_000
 DEFAULT_LLM_HOST = "http://192.168.86.33:11433"
 DEFAULT_LLM_MODEL = "qwen3.5:35b"
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
@@ -74,90 +78,6 @@ def get_connection():
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
     )
-
-
-def init_db(conn):
-    """Create tables if they don't exist."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS runs (
-                run_name        VARCHAR(64) PRIMARY KEY,
-                config_hash     CHAR(64),
-                config_yaml     MEDIUMTEXT,
-                description     TEXT,
-                llm_host        VARCHAR(512),
-                llm_model       VARCHAR(255),
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                                          ON UPDATE CURRENT_TIMESTAMP
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                doc_id          INT AUTO_INCREMENT PRIMARY KEY,
-                run_name        VARCHAR(64) NOT NULL,
-                file_path       VARCHAR(256) NOT NULL,
-                file_hash       CHAR(64),
-                file_size_bytes INT,
-                total_chunks    INT DEFAULT 1,
-                status          ENUM('processing','complete','error')
-                                    DEFAULT 'processing',
-                error_message   TEXT,
-                processing_secs FLOAT,
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_run_path (run_name, file_path),
-                FOREIGN KEY (run_name) REFERENCES runs(run_name)
-                    ON DELETE CASCADE
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS chunk_results (
-                id              INT AUTO_INCREMENT PRIMARY KEY,
-                doc_id          INT NOT NULL,
-                chunk_index     INT NOT NULL,
-                raw_json        MEDIUMTEXT,
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_chunk (doc_id, chunk_index),
-                FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
-                    ON DELETE CASCADE
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS document_features (
-                id              INT AUTO_INCREMENT PRIMARY KEY,
-                doc_id          INT NOT NULL,
-                feature_name    VARCHAR(255) NOT NULL,
-                value_text      VARCHAR(1024),
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_feature (doc_id, feature_name),
-                FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
-                    ON DELETE CASCADE
-            )
-        """)
-        # Indexes for filter joins on large corpora
-        _create_index_if_missing(
-            cur, "idx_df_feature_value", "document_features",
-            "(feature_name, value_text(128))"
-        )
-        _create_index_if_missing(
-            cur, "idx_doc_run_status", "documents",
-            "(run_name, status)"
-        )
-
-
-def _create_index_if_missing(cursor, index_name, table_name, columns_sql):
-    """Create an index only if it does not already exist (MySQL compatible)."""
-    cursor.execute(
-        "SELECT 1 FROM information_schema.statistics "
-        "WHERE table_schema = DATABASE() "
-        "AND table_name = %s AND index_name = %s LIMIT 1",
-        (table_name, index_name),
-    )
-    if not cursor.fetchone():
-        cursor.execute(
-            f"CREATE INDEX {index_name} ON {table_name} {columns_sql}"
-        )
-
 
 def get_or_create_run(conn, run_name, config, config_hash, host, model):
     with conn.cursor() as cur:
@@ -466,25 +386,140 @@ def purge_run_db(conn, run_name):
 
 
 # ===========================================================================
+# Text Sanitization
+# ===========================================================================
+
+# Control characters that are illegal in JSON (and useless to the LLM)
+_CONTROL_CHAR_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]"
+)
+
+# HTML tag pattern (keeps text content, strips markup)
+_HTML_TAG_RE = re.compile(r"<[^>]+>", re.DOTALL)
+
+# Collapse runs of whitespace
+_MULTI_SPACE_RE = re.compile(r"[ \t]+")
+_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+def sanitize_text(text):
+    """Clean document text for LLM consumption.
+
+    - Strips HTML tags (keeps text content)
+    - Removes control characters that break JSON encoding
+    - Decodes common HTML entities
+    - Normalizes excessive whitespace
+
+    This handles Word-generated HTML, malformed markup, and documents
+    with embedded control characters.
+    """
+    # Strip HTML tags if present (check before expensive regex)
+    if "<" in text and ">" in text:
+        # Decode common HTML entities first
+        text = text.replace("&nbsp;", " ")
+        text = text.replace("&amp;", "&")
+        text = text.replace("&lt;", "<")
+        text = text.replace("&gt;", ">")
+        text = text.replace("&quot;", '"')
+        text = text.replace("&#39;", "'")
+        text = text.replace("&rsquo;", "\u2019")
+        text = text.replace("&ldquo;", "\u201c")
+        text = text.replace("&rdquo;", "\u201d")
+        text = text.replace("&mdash;", "\u2014")
+        text = text.replace("&ndash;", "\u2013")
+        # Strip HTML comments
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        # Strip style/script blocks entirely
+        text = re.sub(
+            r"<(style|script)[^>]*>.*?</\1>", "", text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Strip remaining tags
+        text = _HTML_TAG_RE.sub(" ", text)
+
+    # Remove control characters
+    text = _CONTROL_CHAR_RE.sub("", text)
+
+    # Normalize whitespace
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
+
+    return text.strip()
+
+
+# ===========================================================================
 # Chunking
 # ===========================================================================
 
-def split_into_sections(text):
-    """Split text at the best available structural delimiter."""
-    # HTML headers
-    if re.search(r"<h[1-3][\s>]", text, re.IGNORECASE):
-        parts = re.split(r"(?=<h[1-3][\s>])", text, flags=re.IGNORECASE)
-        return [p for p in parts if p.strip()]
-
-    # Markdown headers
-    if re.search(r"^#{1,3}\s", text, re.MULTILINE):
-        parts = re.split(r"(?=^#{1,3}\s)", text, flags=re.MULTILINE)
-        return [p for p in parts if p.strip()]
-
-    # Paragraph breaks (double newline)
-    parts = re.split(r"\n\s*\n", text)
-    return [p for p in parts if p.strip()]
-
+def split_into_sections(text, target_chars):
+    """Split text into sections using cascading strategies.
+ 
+    Tries each strategy in order; any section still over *target_chars*
+    is re-split with the next finer strategy. Final fallback is a hard
+    character-boundary split.
+ 
+    Strategy hierarchy:
+      1. HTML headers (<h1>–<h3>)
+      2. Markdown headers (# ## ###)
+      3. Paragraph breaks (double newline)
+      4. Sentence boundaries (after . ! ?)
+      5. Single line breaks
+      6. Hard split at target_chars (last resort)
+    """
+    strategies = [
+        re.compile(r"(?=<h[1-3][\s>])", re.IGNORECASE),
+        re.compile(r"(?=^#{1,3}\s)", re.MULTILINE),
+        re.compile(r"\n\s*\n"),
+        re.compile(r"(?<=[.!?])\s+"),
+        re.compile(r"\n"),
+    ]
+ 
+    sections = [text]
+ 
+    for pattern in strategies:
+        # Stop early if everything already fits
+        if all(len(s) <= target_chars for s in sections):
+            break
+ 
+        refined = []
+        for section in sections:
+            if len(section) <= target_chars:
+                refined.append(section)
+                continue
+ 
+            # Attempt to split the oversized section
+            parts = pattern.split(section)
+            parts = [p for p in parts if p.strip()]
+ 
+            if len(parts) > 1:
+                refined.extend(parts)
+            else:
+                # Strategy didn't help — pass through for the next one
+                refined.append(section)
+ 
+        sections = refined
+ 
+    # Final fallback: hard split any remaining oversized sections
+    final = []
+    for section in sections:
+        if len(section) <= target_chars:
+            final.append(section)
+        else:
+            # Split at target_chars, trying to break at a space
+            pos = 0
+            while pos < len(section):
+                end = pos + target_chars
+                if end < len(section):
+                    # Look back up to 200 chars for a space to break on
+                    space = section.rfind(" ", end - 200, end)
+                    if space > pos:
+                        end = space
+                chunk = section[pos:end].strip()
+                if chunk:
+                    final.append(chunk)
+                pos = end
+ 
+    return final if final else [text]
 
 def build_chunks(text, target_chars=CHUNK_TARGET_CHARS):
     """Pack sections into chunks up to *target_chars*, never splitting
@@ -492,19 +527,23 @@ def build_chunks(text, target_chars=CHUNK_TARGET_CHARS):
     if len(text) <= target_chars:
         return [text]
 
-    sections = split_into_sections(text)
+    sections = split_into_sections(text, target_chars)
     chunks = []
     buf = []
     buf_len = 0
 
     for sec in sections:
         sec_len = len(sec)
-        if buf and buf_len + sec_len > target_chars:
+        # Cost of adding this section: its length + 2 for "\n\n" if not first
+        add_len = sec_len + (2 if buf else 0)
+        if buf and buf_len + add_len > target_chars:
             chunks.append("\n\n".join(buf))
             buf = []
             buf_len = 0
+            add_len = sec_len  # first in new buffer, no separator
+                                                                  
         buf.append(sec)
-        buf_len += sec_len
+        buf_len += add_len
 
     if buf:
         chunks.append("\n\n".join(buf))
@@ -522,7 +561,7 @@ def build_prompt(features_config, text, chunk_info=None):
         "You are a clinical document analyst. Given the document text below, "
         "extract the requested features.",
         "",
-        "Respond with ONLY a valid JSON object — no explanation, no markdown "
+        "Respond with ONLY a valid JSON object - no explanation, no markdown "
         "fencing, no commentary, no additional text whatsoever.",
         "",
     ]
@@ -594,6 +633,7 @@ def call_llm(host, model, prompt):
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
+        # "max_completion_tokens": 2048,
     }
 
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
@@ -642,16 +682,37 @@ def call_llm(host, model, prompt):
 
 
 def parse_json_response(raw):
-    """Extract a JSON object from the LLM response, tolerating markdown
-    fences, chain-of-thought preamble, and other wrapping."""
+    """Extract a JSON object (dict) from the LLM response, tolerating
+    markdown fences, chain-of-thought preamble, and other wrapping.
+
+    Raises ValueError with diagnostic detail if parsing fails.
+    """
+    if raw is None:
+        raise ValueError("LLM returned None (empty response).")
+
     # Strip markdown code fences
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
     cleaned = re.sub(r"\n?\s*```\s*$", "", cleaned)
 
+    def _validate(obj):
+        """Ensure the parsed JSON is a dict, not null/list/string."""
+        if obj is None:
+            raise ValueError(
+                "LLM returned JSON null instead of an object. "
+                "The model may have failed to extract features from "
+                "this document."
+            )
+        if not isinstance(obj, dict):
+            raise ValueError(
+                f"LLM returned JSON {type(obj).__name__} instead of "
+                f"an object: {str(obj)[:200]}"
+            )
+        return obj
+
     # Direct parse
     try:
-        return json.loads(cleaned)
+        return _validate(json.loads(cleaned))
     except json.JSONDecodeError:
         pass
 
@@ -667,11 +728,33 @@ def parse_json_response(raw):
             depth -= 1
             if depth == 0 and start is not None:
                 try:
-                    return json.loads(cleaned[start : i + 1])
+                    return _validate(json.loads(cleaned[start : i + 1]))
                 except json.JSONDecodeError:
                     start = None
 
-    raise ValueError(f"Could not parse JSON from LLM response:\n{raw[:500]}")
+    # Attempt to repair truncated JSON (response hit token limit)
+    if start is not None and depth > 0:
+        # We found an opening { but never closed it — try closing it
+        fragment = cleaned[start:]
+        # Close any open strings, then close braces
+        repair = fragment.rstrip()
+        if repair.endswith(","):
+            repair = repair[:-1]
+        # Close any open string
+        if repair.count('"') % 2 == 1:
+            repair += '"'
+        # Close braces
+        repair += "}" * depth
+        try:
+            return _validate(json.loads(repair))
+        except json.JSONDecodeError:
+            pass
+
+    # Build a diagnostic message
+    preview = raw[:500]
+    if len(raw) > 500:
+        preview += f"\n... ({len(raw)} chars total)"
+    raise ValueError(f"Could not parse JSON from LLM response:\n{raw}")
 
 
 # ===========================================================================
@@ -763,15 +846,31 @@ def merge_chunk_results(chunk_jsons, features_config):
 # File Discovery
 # ===========================================================================
 
-def discover_files(corpus_path):
-    """Yield paths of text files under *corpus_path* (recursively)."""
-    root = Path(corpus_path)
-    if root.is_file():
-        yield str(root)
-        return
-    for f in sorted(root.rglob("*")):
-        if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS:
-            yield str(f)
+def discover_files(corpus_paths):
+    """Yield deduplicated paths of text files under one or more corpus paths.
+    *corpus_paths* can be a single string/Path or a list of them.
+    Each entry can be a directory (searched recursively) or a single file.
+    Files are deduplicated by resolved path so overlapping directories
+    don't cause duplicate processing.
+    """
+    if isinstance(corpus_paths, (str, Path)):
+        corpus_paths = [corpus_paths]
+
+    seen = set()
+    for cp in corpus_paths:
+        root = Path(cp)
+        if root.is_file():
+            resolved = str(root.resolve())
+            if resolved not in seen:
+                seen.add(resolved)
+                yield str(root)
+            continue
+        for f in sorted(root.rglob("*")):
+            if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS:
+                resolved = str(f.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    yield str(f)
 
 
 def file_hash(path):
@@ -818,7 +917,6 @@ def process_corpus(args, config):
     model = args.model or config.get("llm", {}).get("model", DEFAULT_LLM_MODEL)
 
     conn = get_connection()
-    init_db(conn)
 
     config_hash = hashlib.sha256(yaml.dump(config).encode()).hexdigest()
     get_or_create_run(conn, args.run_name, config, config_hash, host, model)
@@ -827,6 +925,15 @@ def process_corpus(args, config):
     skip_errors = not args.retry_errors
     finished = get_finished_paths(conn, args.run_name, include_errors=skip_errors)
 
+    # --- Resolve corpus paths: CLI overrides YAML ---
+    corpus_paths = args.corpus  # list or None (from action="append")
+    if not corpus_paths:
+        # Fall back to config YAML
+        yaml_corpus = config.get("corpus", [])
+        if isinstance(yaml_corpus, str):
+            yaml_corpus = [yaml_corpus]
+        corpus_paths = yaml_corpus if yaml_corpus else None
+
     # --- File discovery: filter mode vs. corpus mode ---
     filter_config = config.get("filter")
     if filter_config:
@@ -834,15 +941,20 @@ def process_corpus(args, config):
         all_files = get_filtered_paths(conn, filter_config)
         source_label = f"filter from run '{filter_config['from_run']}'"
 
-        # If --corpus is also specified, intersect with filesystem
-        if args.corpus:
-            corpus_files = set(discover_files(args.corpus))
+        # If corpus also specified, intersect with filesystem
+        if corpus_paths:
+            corpus_files = set(discover_files(corpus_paths))
             all_files = [f for f in all_files if f in corpus_files]
-            source_label += f" ∩ {args.corpus}"
+            source_label += f" ∩ [{', '.join(corpus_paths)}]"
     else:
-        all_files = list(discover_files(args.corpus))
-        source_label = f"{args.corpus}  ({len(all_files)} files)"
-
+        all_files = list(discover_files(corpus_paths))
+        if len(corpus_paths) == 1:
+            source_label = f"{corpus_paths[0]}  ({len(all_files)} files)"
+        else:
+            source_label = (
+                f"{len(corpus_paths)} paths  ({len(all_files)} files)\n"
+                + "".join(f"               {p}\n" for p in corpus_paths)
+            ).rstrip()
     pending = [f for f in all_files if f not in finished]
 
     print(f"Run          : {args.run_name}", file=sys.stderr)
@@ -880,11 +992,20 @@ def process_corpus(args, config):
         doc_start = time.time()
         doc_id = None
         try:
-            text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            raw_bytes = Path(file_path).read_bytes()
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = raw_bytes.decode("cp1252")
+                except:
+                    text = raw_bytes.decode("utf-8", errors="replace")
             fhash = file_hash(file_path)
             fsize = os.path.getsize(file_path)
 
-            chunks = build_chunks(text)
+            # Chunk on raw text (preserves HTML structure for splitting),
+            # then sanitize each chunk individually before sending to LLM
+            chunks = build_chunks(text, target_chars=args.chunk_size)
             num_chunks = len(chunks)
 
             doc_id = upsert_document(
@@ -895,8 +1016,11 @@ def process_corpus(args, config):
             for ci, chunk_text in enumerate(chunks):
                 if _interrupted:
                     break
+                clean_chunk = sanitize_text(chunk_text)
+                if not clean_chunk:
+                    continue  # skip empty chunks (e.g., pure HTML boilerplate)
                 chunk_info = (ci + 1, num_chunks) if num_chunks > 1 else None
-                prompt = build_prompt(features_config, chunk_text, chunk_info)
+                prompt = build_prompt(features_config, clean_chunk, chunk_info)
                 raw = call_llm(host, model, prompt)
                 parsed = parse_json_response(raw)
                 save_chunk_result(conn, doc_id, ci, json.dumps(parsed))
@@ -996,11 +1120,17 @@ examples:
   # Full run (resumes automatically)
   %(prog)s -c features.yaml --corpus /data/notes/ -r lung_v1
 
+  # Multiple corpus directories
+  %(prog)s -c features.yaml --corpus /data/2023/ --corpus /data/2024/ -r lung_v1
+
+  # Corpus paths in YAML config (no --corpus needed)
+  %(prog)s -c features.yaml -r lung_v1
+
+  # CLI --corpus overrides YAML corpus paths
+  %(prog)s -c features.yaml --corpus /data/subset/ -r lung_test
+
   # Filtered run — config YAML contains a 'filter' section
   %(prog)s -c lung_details.yaml -r lung_details_v1 -n 10
-
-  # Filtered run with corpus intersection
-  %(prog)s -c lung_details.yaml --corpus /data/notes/2024/ -r lung_details_v1
 
   # Retry documents that errored
   %(prog)s -c features.yaml --corpus /data/notes/ -r lung_v1 --retry-errors
@@ -1015,7 +1145,11 @@ examples:
 
     # Processing arguments
     parser.add_argument("-c", "--config", help="YAML feature-definition file.")
-    parser.add_argument("--corpus", help="Path to document directory (or single file).")
+    parser.add_argument(
+        "--corpus", action="append", default=None,
+        help="Path to document directory or file. Can be specified multiple "
+             "times. Overrides corpus paths in the YAML config if provided.",
+    )
     parser.add_argument("-r", "--run-name", help="Name for this run (used for resume).")
     parser.add_argument(
         "-n", "--limit", type=int, help="Stop after N documents."
@@ -1029,6 +1163,12 @@ examples:
         "--cooldown", type=float, default=0, metavar="SECS",
         help="Pause N seconds between documents to reduce thermal load. "
              "Recommended: 3-5s for DGX Spark or similar compact hardware.",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=CHUNK_TARGET_CHARS, metavar="CHARS",
+        help=f"Max characters per chunk (default: {CHUNK_TARGET_CHARS:,}). "
+             "Reduce for models with smaller context windows. "
+             "Rule of thumb: context_tokens × 3 for clinical text.",
     )
 
     # LLM overrides (take precedence over config file)
@@ -1053,7 +1193,6 @@ examples:
     # ---- list-runs ----
     if args.list_runs:
         conn = get_connection()
-        init_db(conn)
         runs = list_runs_db(conn)
         conn.close()
         if not runs:
@@ -1075,7 +1214,6 @@ examples:
     # ---- purge-run ----
     if args.purge_run:
         conn = get_connection()
-        init_db(conn)
         confirm = input(f"Delete run '{args.purge_run}' and all associated data? [y/N] ")
         if confirm.strip().lower() == "y":
             purge_run_db(conn, args.purge_run)
@@ -1094,13 +1232,15 @@ examples:
     if "features" not in config or not config["features"]:
         parser.error("Config must contain a 'features' section with at least one feature.")
 
-    # --corpus is required unless the config has a filter section
+    # --corpus is required unless the config has corpus paths or a filter section
     has_filter = "filter" in config and config["filter"]
-    if not args.corpus and not has_filter:
+    has_yaml_corpus = bool(config.get("corpus"))
+    has_cli_corpus = bool(args.corpus)
+    if not has_cli_corpus and not has_yaml_corpus and not has_filter:
         parser.error(
-            "--corpus is required when the config does not contain a 'filter' section."
+            "No corpus specified. Provide --corpus on the command line, "
+            "'corpus' in the YAML config, or a 'filter' section."
         )
-
     # Validate filter section if present
     if has_filter:
         fc = config["filter"]
