@@ -16,7 +16,7 @@ Large documents are automatically chunked at structural boundaries (HTML headers
 ## Quick Start
 
 ```bash
-pip install pymysql pyyaml requests python-dotenv
+pip install -r requirements.txt 
 
 # Configure database credentials
 cp env.example .env

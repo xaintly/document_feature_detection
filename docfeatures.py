@@ -41,7 +41,7 @@ load_dotenv()
 # leaving room for the prompt (~1k tokens) and response (~500 tokens).
 # Override with --chunk-size if your model has a different context window.
 CHUNK_TARGET_CHARS = 350_000
-DEFAULT_LLM_HOST = "http://192.168.86.33:11433"
+DEFAULT_LLM_HOST = "http://127.0.0.1:11433"
 DEFAULT_LLM_MODEL = "qwen3.5:35b"
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
 
