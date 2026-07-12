@@ -40,9 +40,9 @@ load_dotenv()
 # At ~3 chars/token for clinical text, 350k chars ≈ 117k tokens,
 # leaving room for the prompt (~1k tokens) and response (~500 tokens).
 # Override with --chunk-size if your model has a different context window.
-CHUNK_TARGET_CHARS = 350_000
-DEFAULT_LLM_HOST = "http://127.0.0.1:11433"
-DEFAULT_LLM_MODEL = "qwen3.5:35b"
+CHUNK_TARGET_CHARS = os.environ.get("CHUNK_TARGET_CHARS",350_000)
+DEFAULT_LLM_HOST = os.environ.get("DEFAULT_LLM_HOST","http://127.0.0.1:11433")
+DEFAULT_LLM_MODEL = os.environ.get("DEFAULT_LLM_MODEL","default")
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
 
 # ---------------------------------------------------------------------------

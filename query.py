@@ -19,12 +19,22 @@ def main():
     parser.add_argument("-a", "--attach", action="append", default=[], help="Image file to attach (can be repeated). Supported: png, jpg, gif, webp.")
     parser.add_argument("-t", "--timeout", default=DEFAULT_TIMEOUT, help=f"Server wait timeout, in minutes (0 to disable, default: {DEFAULT_TIMEOUT} minutes)")
     parser.add_argument("-e", "--temperature", default=None, help=f"Model temperature parameter")
+    parser.add_argument("-c", "--context", default=None, help=f"Context window size")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Ollama server URL (default: {DEFAULT_HOST})")
     args = parser.parse_args()
+    
+    
 
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     if not prompt.strip():
         parser.error("No prompt provided.")
+
+    context = None
+    if args.context != None:
+        context = int(args.context)
+    else:
+        # require as much context as the prompt size, rounded up to next 4k size
+        context= ((len(prompt) // 4096) + 1) * 4096
         
     if int(args.timeout) < 1:
         args.timeout = None
@@ -37,6 +47,9 @@ def main():
         "model": args.model,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_ctx": context
+        }
     }
 
     if args.system:

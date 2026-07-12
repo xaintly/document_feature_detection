@@ -6,6 +6,8 @@ docfeatures is a command-line tool that feeds text documents through a locally-h
 
 ## How It Works
 
+![data flow diagram](https://github.com/xaintly/document_feature_detection/blob/main/examples/data_flow.png?raw=true)
+
 1. You define the features you're looking for in a YAML config file.
 2. docfeatures reads each document, sends it to a local LLM with a generated prompt, and parses the structured JSON response.
 3. Results are stored in MySQL, one row per feature per document.
