@@ -96,7 +96,7 @@ def cleanup_incomplete(conn, run_name):
     """Remove docs stuck in 'processing' (interrupted mid-flight)."""
     with conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM documents WHERE run_name=%s AND status='processing'",
+            "DELETE FROM document_runs WHERE run_name=%s AND status='processing'",
             (run_name,),
         )
         if cur.rowcount:
@@ -109,21 +109,22 @@ def cleanup_incomplete(conn, run_name):
 
 def get_finished_paths(conn, run_name, include_errors=False):
     """Return set of file_paths already finished for this run."""
-    statuses = "('complete','error')" if not include_errors else "('complete')"
     # We skip 'complete' always; we skip 'error' unless retrying
     with conn.cursor() as cur:
         if include_errors:
             # retrying errors — only skip 'complete'
             cur.execute(
-                "SELECT file_path FROM documents "
-                "WHERE run_name=%s AND status='complete'",
+                "SELECT f.file_path FROM document_runs dr "
+                "JOIN files f ON dr.file_id = f.file_id "
+                "WHERE dr.run_name=%s AND dr.status='complete'",
                 (run_name,),
             )
         else:
             # default — skip both 'complete' and 'error'
             cur.execute(
-                "SELECT file_path FROM documents "
-                "WHERE run_name=%s AND status IN ('complete','error')",
+                "SELECT f.file_path FROM document_runs dr "
+                "JOIN files f ON dr.file_id = f.file_id "
+                "WHERE dr.run_name=%s AND dr.status IN ('complete','error')",
                 (run_name,),
             )
         return {row["file_path"] for row in cur.fetchall()}
@@ -163,7 +164,7 @@ def validate_filter(conn, filter_config):
 
         # Check that the source run has completed documents
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM documents "
+            "SELECT COUNT(*) AS cnt FROM document_runs "
             "WHERE run_name=%s AND status='complete'",
             (from_run,),
         )
@@ -190,7 +191,7 @@ def get_filtered_paths(conn, filter_config):
     exclude = filter_config.get("exclude", {})
 
     # Start building the query
-    # d = source documents table
+    # d = source document_runs table, joined to files for file_path
     joins = []
     where_clauses = ["d.run_name = %s", "d.status = 'complete'"]
     params = []
@@ -274,10 +275,11 @@ def get_filtered_paths(conn, filter_config):
             where_clauses.append(f"{alias}.id IS NULL")
 
     sql = (
-        "SELECT d.file_path FROM documents d\n"
+        "SELECT f.file_path FROM document_runs d\n"
+        "JOIN files f ON d.file_id = f.file_id\n"
         + "\n".join(joins)
         + "\nWHERE " + " AND ".join(where_clauses)
-        + "\nORDER BY d.file_path"
+        + "\nORDER BY f.file_path"
     )
     params.append(from_run)
 
@@ -286,20 +288,56 @@ def get_filtered_paths(conn, filter_config):
         return [row["file_path"] for row in cur.fetchall()]
 
 
-def upsert_document(conn, run_name, file_path, file_hash, file_size, total_chunks):
-    """Insert or reset a document row. Returns doc_id."""
+def get_or_create_file(conn, file_path, file_hash, file_size):
+    """Return file_id for file_path, creating the 'files' row on first sight.
+
+    file_hash/file_size_bytes are the file's identity and are set once, on
+    first sight, and never overwritten. If a later run sees a different
+    hash/size for the same path, the file changed on disk between runs —
+    that's logged as an anomaly (it may affect the validity of earlier
+    runs' results) rather than silently treated as the new canonical value.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT file_id, file_hash, file_size_bytes FROM files "
+            "WHERE file_path=%s",
+            (file_path,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                "INSERT INTO files (file_path, file_hash, file_size_bytes) "
+                "VALUES (%s,%s,%s)",
+                (file_path, file_hash, file_size),
+            )
+            return cur.lastrowid
+
+        if row["file_hash"] != file_hash or row["file_size_bytes"] != file_size:
+            print(
+                f"  [ANOMALY] {file_path} differs from its first-seen "
+                f"hash/size — the file changed on disk since an earlier "
+                f"run processed it. Keeping the original as canonical; "
+                f"features from earlier runs may no longer reflect the "
+                f"current file contents.",
+                file=sys.stderr,
+            )
+        return row["file_id"]
+
+
+def upsert_document(conn, run_name, file_id, total_chunks):
+    """Insert or reset a document_runs row. Returns doc_id."""
     with conn.cursor() as cur:
         # Delete any prior incomplete row (cascade cleans chunks/features)
         cur.execute(
-            "DELETE FROM documents "
-            "WHERE run_name=%s AND file_path=%s AND status != 'complete'",
-            (run_name, file_path),
+            "DELETE FROM document_runs "
+            "WHERE run_name=%s AND file_id=%s AND status != 'complete'",
+            (run_name, file_id),
         )
         cur.execute(
-            "INSERT INTO documents "
-            "(run_name, file_path, file_hash, file_size_bytes, total_chunks, status) "
-            "VALUES (%s,%s,%s,%s,%s,'processing')",
-            (run_name, file_path, file_hash, file_size, total_chunks),
+            "INSERT INTO document_runs "
+            "(run_name, file_id, total_chunks, status) "
+            "VALUES (%s,%s,%s,'processing')",
+            (run_name, file_id, total_chunks),
         )
         return cur.lastrowid
 
@@ -314,11 +352,13 @@ def save_chunk_result(conn, doc_id, chunk_index, raw_json_str):
         )
 
 
-def save_document_features(conn, doc_id, features, features_config):
+def save_document_features(conn, doc_id, file_id, features, features_config):
     """Save only positive/non-default feature values. Skips False booleans,
     the lowest (first) enum option, null text, and null integers.
-    Completeness is provable via the documents table (status='complete')."""
-										   
+    Completeness is provable via the document_runs table (status='complete').
+    file_id is denormalized here so features for a document can be looked
+    up across every run without joining back through document_runs."""
+
     with conn.cursor() as cur:
         for name, value in features.items():
             fdef = features_config.get(name, {})
@@ -343,17 +383,17 @@ def save_document_features(conn, doc_id, features, features_config):
                 continue
 
             cur.execute(
-                "INSERT INTO document_features (doc_id, feature_name, value_text) "
-                "VALUES (%s,%s,%s) "
+                "INSERT INTO document_features (doc_id, file_id, feature_name, value_text) "
+                "VALUES (%s,%s,%s,%s) "
                 "ON DUPLICATE KEY UPDATE value_text=VALUES(value_text)",
-                (doc_id, name, str(value)),
+                (doc_id, file_id, name, str(value)),
             )
 
 
 def mark_document(conn, doc_id, status, elapsed=None, error=None):
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE documents SET status=%s, processing_secs=%s, "
+            "UPDATE document_runs SET status=%s, processing_secs=%s, "
             "error_message=%s WHERE doc_id=%s",
             (status, elapsed, error, doc_id),
         )
@@ -367,7 +407,7 @@ def list_runs_db(conn):
                    SUM(CASE WHEN d.status='complete' THEN 1 ELSE 0 END) AS completed,
                    SUM(CASE WHEN d.status='error'    THEN 1 ELSE 0 END) AS errors
             FROM runs r
-            LEFT JOIN documents d ON r.run_name = d.run_name
+            LEFT JOIN document_runs d ON r.run_name = d.run_name
             GROUP BY r.run_name
             ORDER BY r.created_at DESC
         """)
@@ -1008,9 +1048,8 @@ def process_corpus(args, config):
             chunks = build_chunks(text, target_chars=args.chunk_size)
             num_chunks = len(chunks)
 
-            doc_id = upsert_document(
-                conn, args.run_name, file_path, fhash, fsize, num_chunks
-            )
+            file_id = get_or_create_file(conn, file_path, fhash, fsize)
+            doc_id = upsert_document(conn, args.run_name, file_id, num_chunks)
 
             chunk_results_list = []
             for ci, chunk_text in enumerate(chunks):
@@ -1031,7 +1070,7 @@ def process_corpus(args, config):
                 break
 
             merged = merge_chunk_results(chunk_results_list, features_config)
-            save_document_features(conn, doc_id, merged, features_config)
+            save_document_features(conn, doc_id, file_id, merged, features_config)
 
             elapsed = time.time() - doc_start
             mark_document(conn, doc_id, "complete", elapsed=elapsed)

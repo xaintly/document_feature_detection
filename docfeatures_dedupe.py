@@ -63,13 +63,14 @@ def run_exists(conn, run_name):
 
 
 def find_duplicate_hashes(conn, run_name):
-    """Return list of file_hash values that occur more than once in the run."""
+    """Return list of file_hash values shared by more than one file in the run."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT file_hash FROM documents "
-            "WHERE run_name=%s AND file_hash IS NOT NULL "
-            "GROUP BY file_hash HAVING COUNT(*) > 1 "
-            "ORDER BY file_hash",
+            "SELECT f.file_hash FROM document_runs dr "
+            "JOIN files f ON dr.file_id = f.file_id "
+            "WHERE dr.run_name=%s AND f.file_hash IS NOT NULL "
+            "GROUP BY f.file_hash HAVING COUNT(*) > 1 "
+            "ORDER BY f.file_hash",
             (run_name,),
         )
         return [row["file_hash"] for row in cur.fetchall()]
@@ -78,8 +79,9 @@ def find_duplicate_hashes(conn, run_name):
 def get_docs_for_hash(conn, run_name, file_hash):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT doc_id, file_path, status FROM documents "
-            "WHERE run_name=%s AND file_hash=%s ORDER BY doc_id",
+            "SELECT dr.doc_id, dr.file_id, f.file_path, dr.status "
+            "FROM document_runs dr JOIN files f ON dr.file_id = f.file_id "
+            "WHERE dr.run_name=%s AND f.file_hash=%s ORDER BY dr.doc_id",
             (run_name, file_hash),
         )
         return cur.fetchall()
@@ -102,18 +104,18 @@ def pick_keeper(docs):
     return min(pool, key=lambda d: d["doc_id"])
 
 
-def copy_feature(conn, doc_id, feature_name, value_text):
+def copy_feature(conn, doc_id, file_id, feature_name, value_text):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO document_features (doc_id, feature_name, value_text) "
-            "VALUES (%s,%s,%s)",
-            (doc_id, feature_name, value_text),
+            "INSERT INTO document_features (doc_id, file_id, feature_name, value_text) "
+            "VALUES (%s,%s,%s,%s)",
+            (doc_id, file_id, feature_name, value_text),
         )
 
 
 def delete_document(conn, doc_id):
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM documents WHERE doc_id=%s", (doc_id,))
+        cur.execute("DELETE FROM document_runs WHERE doc_id=%s", (doc_id,))
 
 
 def delete_source_file(file_path):
@@ -174,7 +176,7 @@ def dedupe_run(conn, run_name, dry_run, limit, delete_files, report_lines):
             for name, value in dupe_features.items():
                 if name not in keeper_features:
                     if not dry_run:
-                        copy_feature(conn, keeper["doc_id"], name, value)
+                        copy_feature(conn, keeper["doc_id"], keeper["file_id"], name, value)
                     keeper_features[name] = value
                     tags_copied += 1
                     action_lines.append(f"    copied: {name} = {value}")

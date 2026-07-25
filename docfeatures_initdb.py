@@ -5,9 +5,23 @@ docfeatures_initdb.py — One-time database setup for docfeatures.
 Run this once before using docfeatures.py or docfeatures_web.py.
 It creates the database (if needed), tables, and indexes.
 
+Schema shape:
+    files           — stable file identity (file_path, file_hash, file_size_bytes).
+                       One row per unique file_path, regardless of how many runs
+                       have processed it.
+    runs            — one row per named run (feature-definition version).
+    document_runs   — one row per (file, run): status, chunk count, timing, errors.
+                       This is what used to be called 'documents'.
+    chunk_results   — raw per-chunk LLM output for a document_runs row.
+    document_features — extracted feature values for a document_runs row, with
+                       a denormalized file_id so "all features for this file
+                       across every run" doesn't require joining through runs.
+
 Usage:
-    python docfeatures_initdb.py              # create/verify schema
+    python docfeatures_initdb.py              # create/verify schema (fresh DB)
     python docfeatures_initdb.py --check      # verify only, no changes
+    python docfeatures_initdb.py --migrate    # migrate an old 'documents'-table
+                                               # schema to the files/document_runs split
     python docfeatures_initdb.py --reset      # drop and recreate (destructive!)
 
 Reads DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME from .env file.
@@ -23,7 +37,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ===========================================================================
-# Schema definition (single source of truth)
+# Schema definition (single source of truth for a FRESH install)
 # ===========================================================================
 
 TABLES = [
@@ -44,22 +58,37 @@ TABLES = [
         """,
     ),
     (
-        "documents",
+        "files",
         """
-        CREATE TABLE IF NOT EXISTS documents (
-            doc_id          INT AUTO_INCREMENT PRIMARY KEY,
-            run_name        VARCHAR(255) NOT NULL,
-            file_path       VARCHAR(2048) NOT NULL,
+        CREATE TABLE IF NOT EXISTS files (
+            file_id         INT AUTO_INCREMENT PRIMARY KEY,
+            file_path       VARCHAR(255) NOT NULL,
             file_hash       CHAR(64),
             file_size_bytes INT,
+            first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                      ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_file_path (file_path)
+        )
+        """,
+    ),
+    (
+        "document_runs",
+        """
+        CREATE TABLE IF NOT EXISTS document_runs (
+            doc_id          INT AUTO_INCREMENT PRIMARY KEY,
+            run_name        VARCHAR(255) NOT NULL,
+            file_id         INT NOT NULL,
             total_chunks    INT DEFAULT 1,
             status          ENUM('processing','complete','error')
                                 DEFAULT 'processing',
             error_message   TEXT,
             processing_secs FLOAT,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY uq_run_path (run_name, file_path),
+            UNIQUE KEY uq_run_file (run_name, file_id),
             FOREIGN KEY (run_name) REFERENCES runs(run_name)
+                ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(file_id)
                 ON DELETE CASCADE
         )
         """,
@@ -74,7 +103,7 @@ TABLES = [
             raw_json        MEDIUMTEXT,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uq_chunk (doc_id, chunk_index),
-            FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
+            FOREIGN KEY (doc_id) REFERENCES document_runs(doc_id)
                 ON DELETE CASCADE
         )
         """,
@@ -85,11 +114,14 @@ TABLES = [
         CREATE TABLE IF NOT EXISTS document_features (
             id              INT AUTO_INCREMENT PRIMARY KEY,
             doc_id          INT NOT NULL,
+            file_id         INT NOT NULL,
             feature_name    VARCHAR(255) NOT NULL,
             value_text      VARCHAR(1024),
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uq_feature (doc_id, feature_name),
-            FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
+            FOREIGN KEY (doc_id) REFERENCES document_runs(doc_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(file_id)
                 ON DELETE CASCADE
         )
         """,
@@ -98,7 +130,8 @@ TABLES = [
 
 INDEXES = [
     ("idx_df_feature_value", "document_features", "(feature_name, value_text(128))"),
-    ("idx_doc_run_status", "documents", "(run_name, status)"),
+    ("idx_doc_run_status", "document_runs", "(run_name, status)"),
+    ("idx_file_hash", "files", "(file_hash)"),
 ]
 
 
@@ -140,6 +173,27 @@ def table_exists(cursor, table_name):
     return cursor.fetchone() is not None
 
 
+def column_exists(cursor, table_name, column_name):
+    cursor.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() "
+        "AND table_name = %s AND column_name = %s LIMIT 1",
+        (table_name, column_name),
+    )
+    return cursor.fetchone() is not None
+
+
+def fk_exists(cursor, table_name, column_name, ref_table_name):
+    cursor.execute(
+        "SELECT 1 FROM information_schema.KEY_COLUMN_USAGE "
+        "WHERE table_schema = DATABASE() "
+        "AND table_name = %s AND column_name = %s "
+        "AND referenced_table_name = %s LIMIT 1",
+        (table_name, column_name, ref_table_name),
+    )
+    return cursor.fetchone() is not None
+
+
 def database_exists(cursor, db_name):
     cursor.execute(
         "SELECT 1 FROM information_schema.schemata "
@@ -155,6 +209,34 @@ def get_table_row_count(cursor, table_name):
         return cursor.fetchone()["cnt"]
     except Exception:
         return 0
+
+
+def detect_schema_state(cursor):
+    """Classify the DB as 'fresh', 'legacy', 'migrated', or 'partial'.
+
+    'legacy'   — old single-table shape: documents.file_path exists, files
+                 does not.
+    'migrated' — files + document_runs exist, documents is gone, and
+                 document_features already has file_id. Nothing to do.
+    'partial'  — a previous --migrate run was interrupted partway through.
+                 --migrate can be re-run safely; every step is idempotent.
+    'fresh'    — none of the old or new tables exist yet.
+    """
+    has_files = table_exists(cursor, "files")
+    has_document_runs = table_exists(cursor, "document_runs")
+    has_documents = table_exists(cursor, "documents")
+    has_legacy_file_path = has_documents and column_exists(cursor, "documents", "file_path")
+
+    if not has_files and not has_document_runs and not has_documents:
+        return "fresh"
+    if (
+        has_files and has_document_runs and not has_documents
+        and column_exists(cursor, "document_features", "file_id")
+    ):
+        return "migrated"
+    if has_legacy_file_path and not has_files:
+        return "legacy"
+    return "partial"
 
 
 # ===========================================================================
@@ -182,6 +264,14 @@ def do_check(db_name):
     ok = True
 
     with conn.cursor() as cur:
+        state = detect_schema_state(cur)
+        if state in ("legacy", "partial"):
+            print(f"  ✗ Schema is in a '{state}' state (old-style 'documents' table "
+                  f"with file_path found, or a migration was interrupted).")
+            print(f"    Run with --migrate to convert to the files/document_runs schema.")
+            conn.close()
+            return False
+
         # Check tables
         for tname, _ in TABLES:
             if table_exists(cur, tname):
@@ -222,6 +312,17 @@ def do_init(db_name):
             )
             print(f"  Created database '{db_name}'.")
     conn.close()
+
+    conn = get_connection(database=db_name)
+    with conn.cursor() as cur:
+        state = detect_schema_state(cur)
+        if state in ("legacy", "partial"):
+            print()
+            print(f"  This database has an old-style schema ('documents' table "
+                  f"with file_path) that needs migrating.")
+            print(f"  Run: python {os.path.basename(sys.argv[0])} --migrate")
+            conn.close()
+            return
 
     # Create tables and indexes
     conn = get_connection(database=db_name)
@@ -270,6 +371,227 @@ def do_reset(db_name):
     do_init(db_name)
 
 
+def do_migrate(db_name):
+    """Migrate a legacy single-table 'documents' schema to the
+    files / document_runs split, in place. Every step checks its own
+    precondition first, so this is safe to re-run if interrupted.
+    """
+    conn = get_connection(database=db_name)
+
+    with conn.cursor() as cur:
+        state = detect_schema_state(cur)
+        if state == "migrated":
+            print("  Already migrated (files + document_runs present). Nothing to do.")
+            conn.close()
+            return
+        if state == "fresh":
+            print("  No existing schema found. Run without --migrate to create "
+                  "a fresh install of the current schema.")
+            conn.close()
+            return
+
+        print(f"  Detected schema state: {state}")
+
+    confirm = input(
+        f"\nThis will restructure live tables in database '{db_name}':\n"
+        f"  - split 'documents' into 'files' + 'document_runs'\n"
+        f"  - add a 'file_id' column (+ FK) to 'document_features'\n"
+        f"  - 'chunk_results' and 'document_features' keep their existing rows;\n"
+        f"    their FK to 'documents' is repointed at 'document_runs' automatically\n"
+        f"Back up the database first if you have not already.\n"
+        f"Type the database name to confirm: "
+    )
+    if confirm.strip() != db_name:
+        print("Cancelled.")
+        conn.close()
+        return
+
+    print()
+    with conn.cursor() as cur:
+        # --- Step 1: files table ---
+        if not table_exists(cur, "files"):
+            print("  [1/9] Creating 'files' table...")
+            cur.execute("""
+                CREATE TABLE files (
+                    file_id         INT AUTO_INCREMENT PRIMARY KEY,
+                    file_path       VARCHAR(255) NOT NULL,
+                    file_hash       CHAR(64),
+                    file_size_bytes INT,
+                    first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                              ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_file_path (file_path)
+                )
+            """)
+        else:
+            print("  [1/9] 'files' table already exists — skipping create.")
+
+        # --- Step 2: populate files (earliest row per file_path wins) ---
+        cur.execute("SELECT COUNT(*) AS cnt FROM files")
+        if cur.fetchone()["cnt"] == 0 and table_exists(cur, "documents"):
+            print("  [2/9] Populating 'files' from 'documents' "
+                  "(earliest row per file_path is canonical)...")
+            cur.execute("""
+                INSERT INTO files (file_path, file_hash, file_size_bytes, first_seen_at)
+                SELECT d.file_path, d.file_hash, d.file_size_bytes, d.created_at
+                FROM documents d
+                INNER JOIN (
+                    SELECT file_path, MIN(doc_id) AS min_doc_id
+                    FROM documents
+                    GROUP BY file_path
+                ) fd ON d.file_path = fd.file_path AND d.doc_id = fd.min_doc_id
+            """)
+            print(f"        Inserted {cur.rowcount:,} file(s).")
+        else:
+            print("  [2/9] 'files' already populated — skipping.")
+
+        # --- Step 3: anomaly report (informational only, non-blocking) ---
+        if table_exists(cur, "documents"):
+            cur.execute("""
+                SELECT file_path, COUNT(DISTINCT file_hash) AS n
+                FROM documents GROUP BY file_path HAVING COUNT(DISTINCT file_hash) > 1
+            """)
+            anomalies = cur.fetchall()
+            if anomalies:
+                print(f"  [3/9] ANOMALY: {len(anomalies)} file_path(s) have a "
+                      f"different file_hash in different runs (the file changed "
+                      f"on disk between runs). The EARLIEST version was kept as "
+                      f"canonical in 'files'; later runs' extracted features are "
+                      f"unaffected, but their file_hash no longer matches 'files'. "
+                      f"Review:")
+                for a in anomalies[:25]:
+                    print(f"        {a['file_path']}  ({a['n']} distinct hashes)")
+                if len(anomalies) > 25:
+                    print(f"        ... and {len(anomalies) - 25} more.")
+            else:
+                print("  [3/9] No file_hash anomalies across runs.")
+
+        # --- Step 4-7: migrate 'documents' -> 'document_runs' ---
+        if table_exists(cur, "documents"):
+            if not column_exists(cur, "documents", "file_id"):
+                print("  [4/9] Adding 'file_id' column to 'documents'...")
+                cur.execute("ALTER TABLE documents ADD COLUMN file_id INT NULL")
+            else:
+                print("  [4/9] 'documents.file_id' already exists — skipping.")
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM documents WHERE file_id IS NULL")
+            if cur.fetchone()["cnt"] > 0:
+                print("  [5/9] Backfilling 'documents.file_id' from 'files'...")
+                cur.execute("""
+                    UPDATE documents d
+                    JOIN files f ON d.file_path = f.file_path
+                    SET d.file_id = f.file_id
+                    WHERE d.file_id IS NULL
+                """)
+                print(f"        Updated {cur.rowcount:,} row(s).")
+            else:
+                print("  [5/9] 'documents.file_id' already populated — skipping.")
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM documents WHERE file_id IS NULL")
+            remaining = cur.fetchone()["cnt"]
+            if remaining:
+                raise RuntimeError(
+                    f"{remaining} row(s) in 'documents' still have NULL file_id "
+                    f"after backfill — aborting. This should not happen; investigate "
+                    f"before re-running --migrate."
+                )
+
+            print("  [6/9] Enforcing NOT NULL + foreign key + unique key on 'documents'...")
+            cur.execute("""
+                SELECT IS_NULLABLE FROM information_schema.columns
+                WHERE table_schema = DATABASE() AND table_name = 'documents'
+                AND column_name = 'file_id'
+            """)
+            if cur.fetchone()["IS_NULLABLE"] == "YES":
+                cur.execute("ALTER TABLE documents MODIFY file_id INT NOT NULL")
+
+            if not fk_exists(cur, "documents", "file_id", "files"):
+                cur.execute("""
+                    ALTER TABLE documents
+                    ADD CONSTRAINT fk_documents_file
+                    FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE
+                """)
+
+            if index_exists(cur, "documents", "uq_run_path"):
+                cur.execute("ALTER TABLE documents DROP INDEX uq_run_path")
+            if not index_exists(cur, "documents", "uq_run_file"):
+                cur.execute("""
+                    ALTER TABLE documents
+                    ADD UNIQUE KEY uq_run_file (run_name, file_id)
+                """)
+
+            drop_cols = [
+                c for c in ("file_path", "file_hash", "file_size_bytes")
+                if column_exists(cur, "documents", c)
+            ]
+            if drop_cols:
+                print(f"  [7/9] Dropping redundant columns from 'documents': "
+                      f"{', '.join(drop_cols)}...")
+                cur.execute(
+                    "ALTER TABLE documents " +
+                    ", ".join(f"DROP COLUMN {c}" for c in drop_cols)
+                )
+            else:
+                print("  [7/9] Redundant columns already dropped — skipping.")
+
+            print("  [8/9] Renaming 'documents' -> 'document_runs'...")
+            cur.execute("RENAME TABLE documents TO document_runs")
+            print("        Done. chunk_results/document_features FKs now point "
+                  "at document_runs automatically (verified: MySQL updates FK "
+                  "metadata on RENAME TABLE).")
+        else:
+            print("  [4-8/9] 'documents' already migrated to 'document_runs' — skipping.")
+
+        # --- Step 9: document_features gets a denormalized file_id ---
+        if not column_exists(cur, "document_features", "file_id"):
+            print("  [9/9] Adding 'file_id' to 'document_features'...")
+            cur.execute("ALTER TABLE document_features ADD COLUMN file_id INT NULL")
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM document_features WHERE file_id IS NULL"
+        )
+        if cur.fetchone()["cnt"] > 0:
+            print("        Backfilling 'document_features.file_id' from 'document_runs'...")
+            cur.execute("""
+                UPDATE document_features df
+                JOIN document_runs dr ON df.doc_id = dr.doc_id
+                SET df.file_id = dr.file_id
+                WHERE df.file_id IS NULL
+            """)
+            print(f"        Updated {cur.rowcount:,} row(s).")
+
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM document_features WHERE file_id IS NULL"
+        )
+        remaining = cur.fetchone()["cnt"]
+        if remaining:
+            raise RuntimeError(
+                f"{remaining} row(s) in 'document_features' still have NULL "
+                f"file_id after backfill — aborting."
+            )
+
+        cur.execute("""
+            SELECT IS_NULLABLE FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = 'document_features'
+            AND column_name = 'file_id'
+        """)
+        if cur.fetchone()["IS_NULLABLE"] == "YES":
+            cur.execute("ALTER TABLE document_features MODIFY file_id INT NOT NULL")
+
+        if not fk_exists(cur, "document_features", "file_id", "files"):
+            cur.execute("""
+                ALTER TABLE document_features
+                ADD CONSTRAINT fk_document_features_file
+                FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE
+            """)
+        print("        'document_features.file_id' is populated and constrained.")
+
+    conn.close()
+    print()
+    print("Migration complete.")
+    print("Next: update docfeatures.py (and any other scripts) to use the new")
+    print("files/document_runs tables — see docfeatures_web.py, docfeatures_dedupe.py.")
+
+
 # ===========================================================================
 # CLI
 # ===========================================================================
@@ -282,6 +604,7 @@ def main():
 examples:
   %(prog)s                    # create database, tables, and indexes
   %(prog)s --check            # verify schema, report issues
+  %(prog)s --migrate          # migrate an old 'documents'-table schema in place
   %(prog)s --reset            # drop and recreate (asks for confirmation)
   %(prog)s --db my_corpus     # override DB_NAME from .env
         """,
@@ -289,6 +612,10 @@ examples:
     parser.add_argument(
         "--check", action="store_true",
         help="Verify the schema without making changes.",
+    )
+    parser.add_argument(
+        "--migrate", action="store_true",
+        help="Migrate a legacy 'documents' schema to the files/document_runs split.",
     )
     parser.add_argument(
         "--reset", action="store_true",
@@ -311,6 +638,8 @@ examples:
     try:
         if args.reset:
             do_reset(db_name)
+        elif args.migrate:
+            do_migrate(db_name)
         elif args.check:
             ok = do_check(db_name)
             sys.exit(0 if ok else 1)
