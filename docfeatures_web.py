@@ -51,23 +51,61 @@ def get_db():
 # ===========================================================================
 
 def safe_file_path(file_path):
-    """Validate that a file path is under CORPUS_BASE_PATH to prevent
-    path traversal. Returns the resolved path or None."""
+    """Resolve file_path against CORPUS_BASE_PATH and validate the result
+    stays under it, to prevent path traversal escaping the corpus.
+
+    A file_path that looks rooted (contains a ':' -- a Windows drive
+    letter or URI scheme -- or starts with '/' or '\\') is resolved as-is
+    and must already live under CORPUS_BASE_PATH. Everything else is
+    treated as relative to CORPUS_BASE_PATH and joined against it, so
+    docfeatures_web doesn't need to be launched from the corpus directory.
+
+    Returns the resolved absolute path, or None if disallowed.
+    """
     if not CORPUS_BASE_PATH:
         return file_path  # no restriction configured
+
+    base = Path(CORPUS_BASE_PATH).resolve()
+    is_rooted = (
+        ":" in file_path
+        or file_path.startswith("/")
+        or file_path.startswith("\\")
+    )
+
     try:
-        resolved = Path(file_path).resolve()
-        print(resolved)
-        base = Path(CORPUS_BASE_PATH).resolve()
-        if str(resolved).startswith(str(base)):
-            return str(resolved)
+        candidate = Path(file_path) if is_rooted else base / file_path
+        resolved = candidate.resolve()
+        resolved.relative_to(base)  # raises ValueError if outside base
     except (ValueError, OSError):
-        pass
-    return None
+        return None
+
+    return str(resolved)
 
 
-def build_search_query(runs, filters):
+def build_path_filter(term):
+    """Build a slash-agnostic, substring 'file_path' filter.
+
+    Matches anywhere in the path and treats '/' and '\\' as equivalent
+    separators, so a search for "study_1005/lung" matches both
+    "my_studies/study_1005/lung.txt" and "c:\\my_studies\\study_1005\\lung\\3.txt".
+
+    Returns (sql_fragment, param) referencing the 'f' (files) alias, or
+    None if term is blank.
+    """
+    term = (term or "").strip()
+    if not term:
+        return None
+    normalized = term.replace("\\", "/")
+    escaped = normalized.replace("%", r"\%").replace("_", r"\_")
+    sql = r"REPLACE(f.file_path, '\\', '/') LIKE %s ESCAPE '\\'"
+    return sql, f"%{escaped}%"
+
+
+def build_search_query(runs, filters, file_path_search=None):
     """Build a JOIN-based SQL query from search filters.
+
+    file_path_search, if given, is applied once at the outer level (it's
+    a property of the file, not any particular run) via build_path_filter.
 
     Returns (select_sql, count_sql, params) where params is shared
     between both queries.
@@ -171,24 +209,35 @@ def build_search_query(runs, filters):
         join_sql = "\n  ".join(joins)
         where_sql = " AND ".join(where)
         run_select_sql = ( "FROM " if run_number == 0 else "INNER JOIN " ) + (
-            f"(\n  SELECT d.doc_id, d.file_path, d.file_hash, d.run_name, d.file_size_bytes\n"
-            f"  FROM documents d\n  {join_sql}\n"
+            f"(\n  SELECT d.doc_id, d.file_id, d.run_name\n"
+            f"  FROM document_runs d\n  {join_sql}\n"
             f"  WHERE {where_sql}\n) AS {run_alias}"
         )
         if run_number > 0:
-            run_select_sql += f" ON {run_alias}.file_path = q0.file_path"
+            run_select_sql += f" ON {run_alias}.file_id = q0.file_id"
         run_queries.append(run_select_sql)
-        
+
     run_join_sql = "\n".join(run_queries)
 
+    outer_where_sql = ""
+    path_filter = build_path_filter(file_path_search)
+    if path_filter:
+        sql_fragment, param = path_filter
+        outer_where_sql = f"\nWHERE {sql_fragment}"
+        params.append(param)
+
     select_sql = (
-        f"SELECT q0.doc_id, q0.file_path, q0.file_hash, q0.run_name, q0.file_size_bytes\n"
+        f"SELECT q0.doc_id, q0.file_id, q0.run_name, f.file_path, f.file_hash, f.file_size_bytes\n"
         f"{run_join_sql}\n"
-        f"ORDER BY q0.file_path, q0.run_name"
+        f"JOIN files f ON f.file_id = q0.file_id"
+        f"{outer_where_sql}\n"
+        f"ORDER BY f.file_path, q0.run_name"
     )
     count_sql = (
         f"SELECT COUNT(*) AS total\n"
         f"{run_join_sql}\n"
+        f"JOIN files f ON f.file_id = q0.file_id"
+        f"{outer_where_sql}\n"
     )
     # print(select_sql, params, file=sys.stderr)
     return select_sql, count_sql, params
@@ -260,7 +309,7 @@ def api_runs():
                        SUM(CASE WHEN d.status='complete' THEN 1 ELSE 0 END)
                            AS completed
                 FROM runs r
-                LEFT JOIN documents d ON r.run_name = d.run_name
+                LEFT JOIN document_runs d ON r.run_name = d.run_name
                 GROUP BY r.run_name
                 ORDER BY r.created_at DESC
             """)
@@ -306,13 +355,14 @@ def api_search():
     data = request.json or {}
     runs = data.get("runs", [])
     filters = data.get("filters", [])
+    file_path_search = data.get("file_path_search", "")
     page = max(1, data.get("page", 1))
     page_size = min(200, max(1, data.get("page_size", 25)))
 
     if not runs:
         return jsonify({"error": "Select at least one run."}), 400
 
-    select_sql, count_sql, params = build_search_query(runs, filters)
+    select_sql, count_sql, params = build_search_query(runs, filters, file_path_search)
 
     conn = get_db()
     try:
@@ -376,7 +426,9 @@ def api_document_content(doc_id):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT file_path FROM documents WHERE doc_id = %s",
+                "SELECT f.file_path FROM document_runs dr "
+                "JOIN files f ON dr.file_id = f.file_id "
+                "WHERE dr.doc_id = %s",
                 (doc_id,),
             )
             row = cur.fetchone()
@@ -439,24 +491,26 @@ def api_document_features(doc_id):
                 for r in cur.fetchall()
             ]
 
-            # Get run info
+            # Get run info + file identity
             cur.execute(
-                "SELECT run_name, file_path FROM documents "
-                "WHERE doc_id = %s",
+                "SELECT dr.run_name, dr.file_id, f.file_path "
+                "FROM document_runs dr JOIN files f ON dr.file_id = f.file_id "
+                "WHERE dr.doc_id = %s",
                 (doc_id,),
             )
             doc = cur.fetchone()
 
-            # Also get features from other runs of the same file
+            # Also get features from other runs of the same file -- a plain
+            # file_id filter now, no file_path self-join needed.
             if doc:
                 cur.execute(
-                    "SELECT d.run_name, df.feature_name, df.value_text "
-                    "FROM documents d "
-                    "JOIN document_features df ON d.doc_id = df.doc_id "
-                    "WHERE d.file_path = %s AND d.doc_id != %s "
-                    "AND d.status = 'complete' "
-                    "ORDER BY d.run_name, df.feature_name",
-                    (doc["file_path"], doc_id),
+                    "SELECT dr.run_name, df.feature_name, df.value_text "
+                    "FROM document_features df "
+                    "JOIN document_runs dr ON df.doc_id = dr.doc_id "
+                    "WHERE df.file_id = %s AND df.doc_id != %s "
+                    "AND dr.status = 'complete' "
+                    "ORDER BY dr.run_name, df.feature_name",
+                    (doc["file_id"], doc_id),
                 )
                 other_runs = {}
                 for r in cur.fetchall():
@@ -483,11 +537,12 @@ def api_export():
     data = request.json or {}
     runs = data.get("runs", [])
     filters = data.get("filters", [])
+    file_path_search = data.get("file_path_search", "")
 
     if not runs:
         abort(400)
 
-    select_sql, _, params = build_search_query(runs, filters)
+    select_sql, _, params = build_search_query(runs, filters, file_path_search)
     # Remove the ORDER BY / add a limit for safety
     export_sql = select_sql + "\nLIMIT 100000"
 

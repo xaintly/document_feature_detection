@@ -190,6 +190,13 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 <div class="main">
   <!-- Filters -->
   <h2>Filters</h2>
+  <div class="filter-card">
+    <div class="filter-label">File Path</div>
+    <div class="filter-desc">Matches anywhere in the path. Either / or \ works as a separator.</div>
+    <div class="filter-controls">
+      <input type="text" id="filePathSearch" placeholder="e.g. study_1005/lung" style="width:260px">
+    </div>
+  </div>
   <div id="filterArea">
     <div class="filter-empty">Select one or more runs to see available filters.</div>
   </div>
@@ -412,6 +419,10 @@ function clearFilters() {
   document.querySelectorAll('.filter-card input[type="text"], .filter-card input[type="number"]').forEach(i => i.value = '');
 }
 
+function getFilePathSearch() {
+  return document.getElementById('filePathSearch').value.trim();
+}
+
 // =======================================================================
 // Search
 // =======================================================================
@@ -422,8 +433,9 @@ async function doSearch(page) {
   currentPage = page || 1;
   const pageSize = parseInt(document.getElementById('pageSize').value) || 25;
   const filters = gatherFilters();
+  const file_path_search = getFilePathSearch();
 
-  lastSearchPayload = { runs, filters, page: currentPage, page_size: pageSize };
+  lastSearchPayload = { runs, filters, file_path_search, page: currentPage, page_size: pageSize };
 
   const area = document.getElementById('resultsArea');
   area.innerHTML = '<div style="text-align:center;padding:2rem"><div class="spinner"></div> Searching...</div>';
@@ -658,7 +670,11 @@ async function exportCSV() {
     const resp = await fetch('/api/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ runs: lastSearchPayload.runs, filters: lastSearchPayload.filters }),
+      body: JSON.stringify({
+        runs: lastSearchPayload.runs,
+        filters: lastSearchPayload.filters,
+        file_path_search: lastSearchPayload.file_path_search,
+      }),
     });
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
