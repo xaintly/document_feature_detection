@@ -288,6 +288,106 @@ def get_feature_configs_for_runs(conn, run_names):
         return merged
 
 
+def normalize_browse_path(path):
+    """Normalize a browse path to '/' separators, no leading/trailing slash."""
+    return (path or "").strip().replace("\\", "/").strip("/")
+
+
+def pick_representative_doc(rows):
+    """Choose one document_runs row to represent a file for preview when it
+    was touched by multiple runs. Prefer status='complete', tie-break on
+    the lowest doc_id -- the same keeper rule docfeatures_dedupe.py uses."""
+    complete = [r for r in rows if r["status"] == "complete"]
+    pool = complete if complete else rows
+    return min(pool, key=lambda r: r["doc_id"])
+
+
+def list_folder(conn, path, run_name=None):
+    """List immediate subfolders and files directly under `path`.
+
+    If run_name is given, scoped to files that run touched (any status --
+    browsing should surface errored docs too, not just complete ones).
+    Otherwise the union of every file any run has ever touched.
+
+    Returns {"path", "parent", "folders": [...], "files": [...]}.
+    """
+    prefix = normalize_browse_path(path)
+    like_prefix = f"{prefix}/" if prefix else ""
+    escaped_prefix = like_prefix.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+    joins = []
+    join_params = []
+    if run_name:
+        joins.append("JOIN document_runs dr ON dr.file_id = f.file_id AND dr.run_name = %s")
+        join_params.append(run_name)
+
+    sql = (
+        "SELECT DISTINCT f.file_id, f.file_path, f.file_size_bytes\n"
+        "FROM files f\n"
+        + "\n".join(joins) + "\n"
+        "WHERE REPLACE(f.file_path, '\\\\', '/') LIKE %s ESCAPE '\\\\'"
+    )
+    params = join_params + [f"{escaped_prefix}%"]
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+        folders = set()
+        direct_files = []
+        for row in rows:
+            norm = row["file_path"].replace("\\", "/")
+            remainder = norm[len(like_prefix):]
+            if "/" in remainder:
+                folders.add(remainder.split("/", 1)[0])
+            else:
+                direct_files.append(row)
+
+        doc_map = {}
+        file_ids = [f["file_id"] for f in direct_files]
+        if file_ids:
+            ph = ", ".join(["%s"] * len(file_ids))
+            if run_name:
+                cur.execute(
+                    f"SELECT doc_id, file_id, status FROM document_runs "
+                    f"WHERE run_name = %s AND file_id IN ({ph})",
+                    [run_name] + file_ids,
+                )
+            else:
+                cur.execute(
+                    f"SELECT doc_id, file_id, status FROM document_runs "
+                    f"WHERE file_id IN ({ph})",
+                    file_ids,
+                )
+            by_file = {}
+            for r in cur.fetchall():
+                by_file.setdefault(r["file_id"], []).append(r)
+            for fid, fid_rows in by_file.items():
+                doc_map[fid] = pick_representative_doc(fid_rows)
+
+    files_out = []
+    for f in direct_files:
+        rep = doc_map.get(f["file_id"])
+        norm = f["file_path"].replace("\\", "/")
+        files_out.append({
+            "doc_id": rep["doc_id"] if rep else None,
+            "status": rep["status"] if rep else None,
+            "file_path": f["file_path"],
+            "name": norm.rsplit("/", 1)[-1],
+            "file_size": f["file_size_bytes"],
+        })
+    files_out.sort(key=lambda f: f["name"].lower())
+
+    parent = prefix.rsplit("/", 1)[0] if "/" in prefix else ("" if prefix else None)
+
+    return {
+        "path": prefix,
+        "parent": parent,
+        "folders": sorted(folders, key=str.lower),
+        "files": files_out,
+    }
+
+
 # ===========================================================================
 # Routes
 # ===========================================================================
@@ -346,6 +446,23 @@ def api_runs():
                     ),
                 })
         return jsonify(runs)
+    finally:
+        conn.close()
+
+
+@app.route("/api/browse")
+def api_browse():
+    path = request.args.get("path", "")
+    run_name = request.args.get("run") or None
+
+    conn = get_db()
+    try:
+        if run_name:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM runs WHERE run_name = %s", (run_name,))
+                if not cur.fetchone():
+                    return jsonify({"error": f"Run '{run_name}' not found."}), 404
+        return jsonify(list_folder(conn, path, run_name))
     finally:
         conn.close()
 

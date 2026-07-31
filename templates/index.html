@@ -85,6 +85,39 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 .tag-text { background: #e0f2fe; color: #075985; }
 .tag-integer { background: #fef3c7; color: #92400e; }
 
+/* --- Mode tabs --- */
+.mode-tabs { display: flex; gap: .5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--df-border); }
+.mode-tab {
+  font-size: .85rem; font-weight: 500; padding: .5rem .9rem; border: none;
+  background: none; color: var(--df-muted); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.mode-tab:hover { color: #1e293b; }
+.mode-tab.active { color: var(--df-accent-dark); border-bottom-color: var(--df-accent); }
+
+/* --- Browse mode --- */
+.browse-toolbar { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+.breadcrumb { font-size: .82rem; margin-bottom: .75rem; color: var(--df-muted); }
+.breadcrumb .crumb { cursor: pointer; color: var(--df-accent-dark); }
+.breadcrumb .crumb:hover { text-decoration: underline; }
+.browse-list {
+  background: #fff; border: 1px solid var(--df-border); border-radius: 8px; overflow: hidden;
+}
+.browse-row {
+  display: flex; align-items: center; gap: .5rem; padding: .45rem .9rem;
+  font-size: .84rem; cursor: pointer; border-bottom: 1px solid var(--df-border);
+}
+.browse-row:last-child { border-bottom: none; }
+.browse-row:hover { background: #f0f7ff; }
+.browse-row-disabled { cursor: default; color: var(--df-muted); }
+.browse-row-disabled:hover { background: none; }
+.browse-icon { font-size: .9rem; }
+.browse-size { margin-left: auto; font-size: .72rem; color: var(--df-muted); }
+.browse-status {
+  font-size: .65rem; font-weight: 600; text-transform: uppercase; padding: .05rem .35rem;
+  border-radius: 3px; background: #fee2e2; color: #991b1b;
+}
+
 /* --- Toolbar --- */
 .toolbar {
   display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
@@ -188,49 +221,75 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 
 <!-- Main Content -->
 <div class="main">
-  <!-- Filters -->
-  <h2>Filters</h2>
-  <div class="filter-card">
-    <div class="filter-label">File Path</div>
-    <div class="filter-desc">Matches anywhere in the path. Either / or \ works as a separator.</div>
-    <div class="filter-controls">
-      <input type="text" id="filePathSearch" placeholder="e.g. study_1005/lung" style="width:260px">
+  <div class="mode-tabs">
+    <button class="mode-tab active" id="tabSearch" onclick="switchMode('search')">🔍 Search</button>
+    <button class="mode-tab" id="tabBrowse" onclick="switchMode('browse')">📁 Browse</button>
+  </div>
+
+  <div id="searchPanel">
+    <!-- Filters -->
+    <h2>Filters</h2>
+    <div class="filter-card">
+      <div class="filter-label">File Path</div>
+      <div class="filter-desc">Matches anywhere in the path. Either / or \ works as a separator.</div>
+      <div class="filter-controls">
+        <input type="text" id="filePathSearch" placeholder="e.g. study_1005/lung" style="width:260px">
+      </div>
+    </div>
+    <div id="filterArea">
+      <div class="filter-empty">Select one or more runs to see available filters.</div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar" id="toolbar" style="display:none">
+      <button class="btn btn-primary btn-sm" onclick="doSearch(1)">
+        Search
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="clearFilters()">
+        Clear Filters
+      </button>
+      <div style="flex:1"></div>
+      <label style="font-size:.78rem;color:var(--df-muted)">
+        Page size:
+        <select class="page-size-select" id="pageSize" onchange="doSearch(1)">
+          <option value="25" selected>25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
+      <button class="btn btn-outline-secondary btn-sm" onclick="exportCSV()">
+        ↓ CSV
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="showSQL()">
+        { } SQL
+      </button>
+    </div>
+
+    <!-- Results -->
+    <div id="resultsArea">
+      <div class="empty-state">
+        <div class="icon">🔍</div>
+        <div>Select runs and search to view results.</div>
+      </div>
     </div>
   </div>
-  <div id="filterArea">
-    <div class="filter-empty">Select one or more runs to see available filters.</div>
-  </div>
 
-  <!-- Toolbar -->
-  <div class="toolbar" id="toolbar" style="display:none">
-    <button class="btn btn-primary btn-sm" onclick="doSearch(1)">
-      Search
-    </button>
-    <button class="btn btn-outline-secondary btn-sm" onclick="clearFilters()">
-      Clear Filters
-    </button>
-    <div style="flex:1"></div>
-    <label style="font-size:.78rem;color:var(--df-muted)">
-      Page size:
-      <select class="page-size-select" id="pageSize" onchange="doSearch(1)">
-        <option value="25" selected>25</option>
-        <option value="50">50</option>
-        <option value="100">100</option>
-      </select>
-    </label>
-    <button class="btn btn-outline-secondary btn-sm" onclick="exportCSV()">
-      ↓ CSV
-    </button>
-    <button class="btn btn-outline-secondary btn-sm" onclick="showSQL()">
-      { } SQL
-    </button>
-  </div>
-
-  <!-- Results -->
-  <div id="resultsArea">
-    <div class="empty-state">
-      <div class="icon">🔍</div>
-      <div>Select runs and search to view results.</div>
+  <div id="browsePanel" style="display:none">
+    <div class="browse-toolbar">
+      <label style="font-size:.78rem;color:var(--df-muted)">
+        Run:
+        <select class="page-size-select" id="browseRunSelect" onchange="onBrowseRunChanged()">
+          <option value="">All runs</option>
+        </select>
+      </label>
+      <button class="btn btn-outline-secondary btn-sm" onclick="browseUp()">↑ Up</button>
+    </div>
+    <div class="breadcrumb" id="browseBreadcrumb"></div>
+    <div id="browseListing">
+      <div class="empty-state">
+        <div class="icon">📁</div>
+        <div>Loading corpus...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -277,11 +336,28 @@ let mergedFeatures = {};   // feature_name -> {type, options, description}
 let lastSearchPayload = null;
 let lastSQL = '';
 let currentPage = 1;
+let browsePath = '';
+let browseRun = '';
 
 // =======================================================================
 // Init
 // =======================================================================
 document.addEventListener('DOMContentLoaded', loadRuns);
+document.addEventListener('DOMContentLoaded', () => {
+  // Event delegation for browse rows/breadcrumb crumbs: file and folder
+  // names come from user-submitted corpus content, so we read them via
+  // data-* attributes (already HTML-escaped by esc()) rather than
+  // interpolating them into inline onclick="..." JS string literals.
+  document.getElementById('browseListing').addEventListener('click', handleBrowseClick);
+  document.getElementById('browseBreadcrumb').addEventListener('click', handleBrowseClick);
+});
+
+function handleBrowseClick(e) {
+  const folderEl = e.target.closest('[data-browse-folder]');
+  if (folderEl) { loadBrowse(folderEl.dataset.browseFolder); return; }
+  const docEl = e.target.closest('[data-browse-doc]');
+  if (docEl) { openPreview(parseInt(docEl.dataset.browseDoc, 10)); }
+}
 
 async function loadRuns() {
   try {
@@ -421,6 +497,110 @@ function clearFilters() {
 
 function getFilePathSearch() {
   return document.getElementById('filePathSearch').value.trim();
+}
+
+// =======================================================================
+// Mode switching
+// =======================================================================
+function switchMode(mode) {
+  const isSearch = mode === 'search';
+  document.getElementById('searchPanel').style.display = isSearch ? '' : 'none';
+  document.getElementById('browsePanel').style.display = isSearch ? 'none' : '';
+  document.getElementById('sidebar').style.display = isSearch ? '' : 'none';
+  document.getElementById('tabSearch').classList.toggle('active', isSearch);
+  document.getElementById('tabBrowse').classList.toggle('active', !isSearch);
+  if (!isSearch) {
+    populateBrowseRunSelect();
+    loadBrowse(browsePath);
+  }
+}
+
+// =======================================================================
+// Browse
+// =======================================================================
+function populateBrowseRunSelect() {
+  const sel = document.getElementById('browseRunSelect');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All runs</option>' +
+    allRuns.map(r => `<option value="${esc(r.run_name)}">${esc(r.run_name)}</option>`).join('');
+  sel.value = current;
+}
+
+function onBrowseRunChanged() {
+  browseRun = document.getElementById('browseRunSelect').value;
+  loadBrowse(browsePath);
+}
+
+function browseUp() {
+  if (!browsePath) return;
+  const parent = browsePath.includes('/') ? browsePath.slice(0, browsePath.lastIndexOf('/')) : '';
+  loadBrowse(parent);
+}
+
+async function loadBrowse(path) {
+  browsePath = path || '';
+  const area = document.getElementById('browseListing');
+  area.innerHTML = '<div style="text-align:center;padding:2rem"><div class="spinner"></div></div>';
+
+  try {
+    const params = new URLSearchParams({ path: browsePath });
+    if (browseRun) params.set('run', browseRun);
+    const resp = await fetch(`/api/browse?${params}`);
+    const data = await resp.json();
+    if (data.error) {
+      area.innerHTML = `<div class="empty-state">${esc(data.error)}</div>`;
+      return;
+    }
+    renderBreadcrumb(data.path);
+    renderBrowseListing(data);
+  } catch (e) {
+    area.innerHTML = '<div class="empty-state" style="color:#ef4444">Failed to load folder.</div>';
+  }
+}
+
+function renderBreadcrumb(path) {
+  const el = document.getElementById('browseBreadcrumb');
+  const segs = path ? path.split('/') : [];
+  let html = `<span class="crumb" data-browse-folder="">corpus</span>`;
+  let acc = '';
+  segs.forEach(s => {
+    acc = acc ? `${acc}/${s}` : s;
+    html += ` / <span class="crumb" data-browse-folder="${esc(acc)}">${esc(s)}</span>`;
+  });
+  el.innerHTML = html;
+}
+
+function renderBrowseListing(data) {
+  const area = document.getElementById('browseListing');
+  if (!data.folders.length && !data.files.length) {
+    area.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">📂</div>
+        <div>Empty folder${browseRun ? ` for run "${esc(browseRun)}"` : ''}.</div>
+      </div>`;
+    return;
+  }
+
+  const folderRows = data.folders.map(f => {
+    const fullPath = data.path ? `${data.path}/${f}` : f;
+    return `
+    <div class="browse-row" data-browse-folder="${esc(fullPath)}">
+      <span class="browse-icon">📁</span> ${esc(f)}
+    </div>`;
+  }).join('');
+
+  const fileRows = data.files.map(f => {
+    const clickable = f.doc_id != null;
+    const size = f.file_size ? `<span class="browse-size">${fmtSize(f.file_size)}</span>` : '';
+    const statusTag = (f.status && f.status !== 'complete')
+      ? `<span class="browse-status">${esc(f.status)}</span>` : '';
+    return `
+    <div class="browse-row ${clickable ? '' : 'browse-row-disabled'}" ${clickable ? `data-browse-doc="${f.doc_id}"` : ''}>
+      <span class="browse-icon">📄</span> ${esc(f.name)} ${statusTag} ${size}
+    </div>`;
+  }).join('');
+
+  area.innerHTML = `<div class="browse-list">${folderRows}${fileRows}</div>`;
 }
 
 // =======================================================================
@@ -578,10 +758,14 @@ async function openPreview(docId) {
     const contentEl = document.getElementById('previewContent');
     if (contentData.error) {
       contentEl.innerHTML = `<div style="color:#ef4444;padding:1rem">${esc(contentData.error)}</div>`;
-    } else if (contentData.content_type === 'html') {
+    } else if (contentData.content_type === 'html' && contentData.content.match(/<\w+.*?>/) ) {
       const iframe = document.createElement('iframe');
       iframe.sandbox = 'allow-same-origin';
-      if( summaryHTML ) contentData.content = contentData.content.replace(/<body.*?>/i, "$&" + summaryHTML);
+
+      if(!summaryHTML) { }
+      else if( contentData.content.match(/<body.*?>/i) ) contentData.content = contentData.content.replace(/<body.*?>/i, "$&" + summaryHTML);
+      else if( contentData.content.match(/<pre.*?>/i) ) contentData.content = contentData.content.replace(/<pre.*?>/i, summaryHTML + "$&");
+
       iframe.srcdoc = contentData.content;
       iframe.style.cssText = 'border:none;width:100%;height:60vh';
       contentEl.innerHTML = '';
