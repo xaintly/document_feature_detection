@@ -288,6 +288,130 @@ def get_feature_configs_for_runs(conn, run_names):
         return merged
 
 
+def get_feature_configs_per_run(conn, run_names):
+    """Return {run_name: {feature_name: {type, options, description}}},
+    each run's config read independently (NOT merged like
+    get_feature_configs_for_runs). Needed anywhere the exact declared
+    option order / default value matters, since two runs can define the
+    same feature name with different enum options."""
+    if not run_names:
+        return {}
+    ph = ", ".join(["%s"] * len(run_names))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT run_name, config_yaml FROM runs WHERE run_name IN ({ph})",
+            run_names,
+        )
+        result = {}
+        for row in cur.fetchall():
+            cfg = yaml.safe_load(row["config_yaml"]) if row["config_yaml"] else {}
+            feats = {}
+            for fname, fdef in cfg.get("features", {}).items():
+                feats[fname] = {
+                    "type": fdef.get("type", "boolean"),
+                    "options": fdef.get("options", []),
+                    "description": fdef.get("description", ""),
+                }
+            result[row["run_name"]] = feats
+        return result
+
+
+def compute_chart_stats(conn, runs, features):
+    """For each (run, feature) where feature is boolean/enum in that run's
+    own config, compute a full category breakdown -- including the
+    never-stored default value (False / first enum option), inferred by
+    subtracting stored counts from the run's total completed-document
+    count.
+
+    Returns {run_name: {feature_name: {type, total, counts}}} where counts
+    is [{label, count, is_default}, ...] in declared option order (for
+    enums) or [True, False] (for booleans).
+    """
+    if not runs or not features:
+        return {}
+
+    per_run_configs = get_feature_configs_per_run(conn, runs)
+
+    with conn.cursor() as cur:
+        run_ph = ", ".join(["%s"] * len(runs))
+        cur.execute(
+            f"SELECT run_name, COUNT(*) AS cnt FROM document_runs "
+            f"WHERE run_name IN ({run_ph}) AND status='complete' "
+            f"GROUP BY run_name",
+            runs,
+        )
+        totals = {row["run_name"]: row["cnt"] for row in cur.fetchall()}
+
+        feat_ph = ", ".join(["%s"] * len(features))
+        cur.execute(
+            f"SELECT dr.run_name, df.feature_name, df.value_text, COUNT(*) AS cnt\n"
+            f"FROM document_features df\n"
+            f"JOIN document_runs dr ON df.doc_id = dr.doc_id\n"
+            f"WHERE dr.run_name IN ({run_ph}) AND dr.status = 'complete'\n"
+            f"AND df.feature_name IN ({feat_ph})\n"
+            f"GROUP BY dr.run_name, df.feature_name, df.value_text",
+            runs + features,
+        )
+        stored = {}  # (run_name, feature_name) -> {value_text: count}
+        for row in cur.fetchall():
+            key = (row["run_name"], row["feature_name"])
+            stored.setdefault(key, {})[row["value_text"]] = row["cnt"]
+
+    result = {}
+    for run_name in runs:
+        total = totals.get(run_name, 0)
+        run_feats = per_run_configs.get(run_name, {})
+        out_feats = {}
+        for fname in features:
+            fdef = run_feats.get(fname)
+            if not fdef or fdef["type"] not in ("boolean", "enum"):
+                continue
+            stored_counts = stored.get((run_name, fname), {})
+
+            if fdef["type"] == "boolean":
+                # Only 'True' is ever stored; False is inferred.
+                true_count = sum(stored_counts.values())
+                false_count = max(total - true_count, 0)
+                counts = [
+                    {"label": "True", "count": true_count, "is_default": False},
+                    {"label": "False", "count": false_count, "is_default": True},
+                ]
+            else:  # enum
+                options = fdef.get("options") or []
+                option_counts = {opt: 0 for opt in options}
+                leftover = {}
+                for val, c in stored_counts.items():
+                    if val in option_counts:
+                        option_counts[val] += c
+                    else:
+                        # Stored value doesn't match this run's declared
+                        # options (config drift) -- surface it rather than
+                        # silently dropping the count.
+                        leftover[val] = leftover.get(val, 0) + c
+
+                if options:
+                    non_default_total = sum(option_counts[opt] for opt in options[1:])
+                    option_counts[options[0]] = max(
+                        total - non_default_total - sum(leftover.values()), 0
+                    )
+
+                counts = [
+                    {"label": opt, "count": option_counts[opt], "is_default": i == 0}
+                    for i, opt in enumerate(options)
+                ]
+                for val, c in leftover.items():
+                    counts.append({"label": f"{val} (other)", "count": c, "is_default": False})
+
+            out_feats[fname] = {
+                "type": fdef["type"],
+                "total": total,
+                "counts": counts,
+            }
+        if out_feats:
+            result[run_name] = out_feats
+    return result
+
+
 def normalize_browse_path(path):
     """Normalize a browse path to '/' separators, no leading/trailing slash."""
     return (path or "").strip().replace("\\", "/").strip("/")
@@ -463,6 +587,21 @@ def api_browse():
                 if not cur.fetchone():
                     return jsonify({"error": f"Run '{run_name}' not found."}), 404
         return jsonify(list_folder(conn, path, run_name))
+    finally:
+        conn.close()
+
+
+@app.route("/api/chart_stats", methods=["POST"])
+def api_chart_stats():
+    data = request.json or {}
+    runs = data.get("runs", [])
+    features = data.get("features", [])
+    if not runs or not features:
+        return jsonify({"error": "Select at least one run and one feature."}), 400
+
+    conn = get_db()
+    try:
+        return jsonify(compute_chart_stats(conn, runs, features))
     finally:
         conn.close()
 

@@ -118,6 +118,17 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
   border-radius: 3px; background: #fee2e2; color: #991b1b;
 }
 
+/* --- Charts mode --- */
+.feature-picker-item { padding: .3rem 0; font-size: .82rem; }
+.feature-picker-item label { display: flex; align-items: center; gap: .4rem; cursor: pointer; }
+.chart-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 1rem; margin-top: 1rem;
+}
+.chart-card { background: #fff; border: 1px solid var(--df-border); border-radius: 8px; padding: 1rem; }
+.chart-title { font-size: .85rem; font-weight: 600; color: #1e293b; margin-bottom: .5rem; }
+.chart-subtitle { font-size: .72rem; font-weight: 400; color: var(--df-muted); }
+
 /* --- Toolbar --- */
 .toolbar {
   display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
@@ -224,6 +235,7 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
   <div class="mode-tabs">
     <button class="mode-tab active" id="tabSearch" onclick="switchMode('search')">🔍 Search</button>
     <button class="mode-tab" id="tabBrowse" onclick="switchMode('browse')">📁 Browse</button>
+    <button class="mode-tab" id="tabCharts" onclick="switchMode('charts')">📊 Charts</button>
   </div>
 
   <div id="searchPanel">
@@ -292,6 +304,34 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
       </div>
     </div>
   </div>
+
+  <div id="chartsPanel" style="display:none">
+    <div class="filter-card">
+      <div class="filter-label">Features to Chart</div>
+      <div class="filter-desc">Boolean and enum features only, merged across selected runs.</div>
+      <div class="filter-controls" id="chartFeaturePicker" style="display:block">
+        <div class="filter-empty">Select one or more runs to see chartable features.</div>
+      </div>
+    </div>
+    <div class="toolbar" id="chartToolbar">
+      <button class="btn btn-primary btn-sm" onclick="generateCharts()">Generate Charts</button>
+      <label style="font-size:.78rem;color:var(--df-muted)">
+        <input type="radio" name="chartType" value="bar" checked onchange="onChartOptionsChanged()"> Bar
+      </label>
+      <label style="font-size:.78rem;color:var(--df-muted)">
+        <input type="radio" name="chartType" value="pie" onchange="onChartOptionsChanged()"> Pie
+      </label>
+      <label style="font-size:.78rem;color:var(--df-muted)">
+        <input type="checkbox" id="hideDefaultToggle" onchange="onChartOptionsChanged()"> Hide default/majority value
+      </label>
+    </div>
+    <div id="chartsResultsArea">
+      <div class="empty-state">
+        <div class="icon">📊</div>
+        <div>Select runs and features, then Generate Charts.</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- Document Preview Modal -->
@@ -327,6 +367,7 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
 <script>
 // =======================================================================
 // State
@@ -417,6 +458,7 @@ function onRunSelectionChanged() {
   });
   renderFilters();
   document.getElementById('toolbar').style.display = runs.length ? 'flex' : 'none';
+  renderChartFeaturePicker();
 }
 
 // =======================================================================
@@ -503,13 +545,16 @@ function getFilePathSearch() {
 // Mode switching
 // =======================================================================
 function switchMode(mode) {
-  const isSearch = mode === 'search';
-  document.getElementById('searchPanel').style.display = isSearch ? '' : 'none';
-  document.getElementById('browsePanel').style.display = isSearch ? 'none' : '';
-  document.getElementById('sidebar').style.display = isSearch ? '' : 'none';
-  document.getElementById('tabSearch').classList.toggle('active', isSearch);
-  document.getElementById('tabBrowse').classList.toggle('active', !isSearch);
-  if (!isSearch) {
+  document.getElementById('searchPanel').style.display = mode === 'search' ? '' : 'none';
+  document.getElementById('browsePanel').style.display = mode === 'browse' ? '' : 'none';
+  document.getElementById('chartsPanel').style.display = mode === 'charts' ? '' : 'none';
+  // The run-checklist sidebar is shared by Search and Charts (both want
+  // multi-run selection); Browse uses its own single-run dropdown instead.
+  document.getElementById('sidebar').style.display = mode === 'browse' ? 'none' : '';
+  document.getElementById('tabSearch').classList.toggle('active', mode === 'search');
+  document.getElementById('tabBrowse').classList.toggle('active', mode === 'browse');
+  document.getElementById('tabCharts').classList.toggle('active', mode === 'charts');
+  if (mode === 'browse') {
     populateBrowseRunSelect();
     loadBrowse(browsePath);
   }
@@ -601,6 +646,194 @@ function renderBrowseListing(data) {
   }).join('');
 
   area.innerHTML = `<div class="browse-list">${folderRows}${fileRows}</div>`;
+}
+
+// =======================================================================
+// Charts
+// =======================================================================
+let lastChartData = null;
+let chartInstances = [];
+const CHART_PALETTE = ['#3b82f6', '#f59e0b', '#10b981', '#8b5cf6', '#ef4444', '#06b6d4', '#f43f5e', '#84cc16'];
+
+function renderChartFeaturePicker() {
+  const area = document.getElementById('chartFeaturePicker');
+  const entries = Object.entries(mergedFeatures).filter(([, fd]) => fd.type === 'boolean' || fd.type === 'enum');
+  if (!entries.length) {
+    area.innerHTML = '<div class="filter-empty">Select one or more runs to see chartable features.</div>';
+    return;
+  }
+  const checked = new Set(getCheckedChartFeatures());
+  area.innerHTML = entries.map(([fn, fd]) => `
+    <div class="feature-picker-item">
+      <label>
+        <input type="checkbox" class="chart-feature-checkbox" value="${esc(fn)}" ${checked.has(fn) ? 'checked' : ''}>
+        ${esc(fn)} <span class="filter-type-tag tag-${fd.type}">${fd.type}</span>
+      </label>
+    </div>`).join('');
+}
+
+function getCheckedChartFeatures() {
+  return Array.from(document.querySelectorAll('.chart-feature-checkbox:checked')).map(i => i.value);
+}
+
+async function generateCharts() {
+  const runs = getSelectedRuns();
+  const features = getCheckedChartFeatures();
+  const area = document.getElementById('chartsResultsArea');
+
+  if (!runs.length || !features.length) {
+    area.innerHTML = '<div class="empty-state">Select at least one run and one feature.</div>';
+    return;
+  }
+
+  area.innerHTML = '<div style="text-align:center;padding:2rem"><div class="spinner"></div> Loading stats...</div>';
+
+  try {
+    const resp = await fetch('/api/chart_stats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs, features }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      area.innerHTML = `<div class="empty-state">${esc(data.error)}</div>`;
+      return;
+    }
+    lastChartData = data;
+    renderCharts(data, features);
+  } catch (e) {
+    area.innerHTML = '<div class="empty-state" style="color:#ef4444">Failed to load chart data.</div>';
+  }
+}
+
+function onChartOptionsChanged() {
+  if (lastChartData) renderCharts(lastChartData, getCheckedChartFeatures());
+}
+
+function destroyCharts() {
+  chartInstances.forEach(c => c.destroy());
+  chartInstances = [];
+}
+
+function renderCharts(data, features) {
+  destroyCharts();
+  const area = document.getElementById('chartsResultsArea');
+  const chartType = document.querySelector('input[name="chartType"]:checked').value;
+  const hideDefault = document.getElementById('hideDefaultToggle').checked;
+  const runsWithData = Object.keys(data);
+
+  area.innerHTML = '<div class="chart-grid" id="chartGrid"></div>';
+  const grid = document.getElementById('chartGrid');
+
+  if (chartType === 'bar') {
+    features.forEach(fname => renderBarChart(grid, fname, data, runsWithData, hideDefault));
+  } else {
+    features.forEach(fname => {
+      runsWithData.forEach(rn => renderPieChart(grid, fname, rn, data, hideDefault));
+    });
+  }
+
+  if (!grid.children.length) {
+    area.innerHTML = '<div class="empty-state">No boolean/enum data for the selected runs and features.</div>';
+  }
+}
+
+function renderBarChart(grid, fname, data, runsWithData, hideDefault) {
+  const perRun = runsWithData
+    .map(rn => ({ run: rn, stat: data[rn][fname] }))
+    .filter(x => x.stat);
+  if (!perRun.length) return;
+
+  // Union of categories across every run that has this feature, in
+  // first-seen order -- runs can define an enum's options differently
+  // across versions, so don't assume they all share one run's exact set.
+  const labelOrder = [];
+  const labelIsDefault = {};
+  perRun.forEach(x => {
+    x.stat.counts.forEach(c => {
+      if (!(c.label in labelIsDefault)) {
+        labelOrder.push(c.label);
+        labelIsDefault[c.label] = c.is_default;
+      }
+    });
+  });
+  const labels = labelOrder.filter(l => !hideDefault || !labelIsDefault[l]);
+  if (!labels.length) return;
+
+  const card = document.createElement('div');
+  card.className = 'chart-card';
+  const canvasId = `chart_${fname}`.replace(/[^a-zA-Z0-9_]/g, '_');
+  card.innerHTML = `<div class="chart-title">${esc(fname)}</div><canvas id="${canvasId}"></canvas>`;
+  grid.appendChild(card);
+
+  const datasets = perRun.map((x, i) => {
+    const byLabel = Object.fromEntries(x.stat.counts.map(c => [c.label, c]));
+    const counts = labels.map(l => byLabel[l]?.count ?? 0);
+    const pcts = counts.map(c => x.stat.total ? (c / x.stat.total * 100) : 0);
+    return {
+      label: x.run,
+      data: pcts,
+      backgroundColor: CHART_PALETTE[i % CHART_PALETTE.length],
+      _counts: counts,
+    };
+  });
+
+  chartInstances.push(new Chart(document.getElementById(canvasId), {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${ctx.dataset._counts[ctx.dataIndex]} (${ctx.parsed.y.toFixed(1)}%)`,
+          },
+        },
+      },
+      scales: {
+        y: { beginAtZero: true, max: 100, title: { display: true, text: '% of documents' } },
+      },
+    },
+  }));
+}
+
+function renderPieChart(grid, fname, runName, data, hideDefault) {
+  const stat = data[runName]?.[fname];
+  if (!stat) return;
+  const counts = hideDefault ? stat.counts.filter(c => !c.is_default) : stat.counts;
+  if (!counts.length) return;
+
+  const card = document.createElement('div');
+  card.className = 'chart-card';
+  const canvasId = `chart_${fname}_${runName}`.replace(/[^a-zA-Z0-9_]/g, '_');
+  card.innerHTML = `
+    <div class="chart-title">${esc(fname)} <span class="chart-subtitle">${esc(runName)} · n=${stat.total.toLocaleString()}</span></div>
+    <canvas id="${canvasId}"></canvas>`;
+  grid.appendChild(card);
+
+  chartInstances.push(new Chart(document.getElementById(canvasId), {
+    type: 'pie',
+    data: {
+      labels: counts.map(c => c.label),
+      datasets: [{
+        data: counts.map(c => c.count),
+        backgroundColor: counts.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]),
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const pct = stat.total ? (ctx.parsed / stat.total * 100).toFixed(1) : '0.0';
+              return `${ctx.label}: ${ctx.parsed} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  }));
 }
 
 // =======================================================================
