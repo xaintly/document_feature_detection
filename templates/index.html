@@ -84,6 +84,10 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 .tag-enum { background: #ede9fe; color: #5b21b6; }
 .tag-text { background: #e0f2fe; color: #075985; }
 .tag-integer { background: #fef3c7; color: #92400e; }
+.filter-run-tag {
+  font-size: .65rem; font-weight: 600; padding: .05rem .35rem; border-radius: 3px;
+  background: #e2e8f0; color: #475569; margin-left: .35rem; vertical-align: middle;
+}
 
 /* --- Mode tabs --- */
 .mode-tabs { display: flex; gap: .5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--df-border); }
@@ -373,7 +377,10 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 // State
 // =======================================================================
 let allRuns = [];
-let mergedFeatures = {};   // feature_name -> {type, options, description}
+let mergedFeatures = {};   // feature_name -> {type, options, description} (union across runs, for Charts)
+let searchFeatureEntries = [];   // [{feature, run, type, options, description}], one per
+                                  // (feature, run) pair actually present -- lets Search build
+                                  // per-run filters even when two runs share a feature name
 let lastSearchPayload = null;
 let lastSQL = '';
 let currentPage = 1;
@@ -427,7 +434,7 @@ function renderRunList() {
       <input type="checkbox" value="${esc(r.run_name)}" onchange="onRunSelectionChanged()">
       <div>
         <div class="run-name">${esc(r.run_name)}</div>
-        <div class="run-meta">${r.completed.toLocaleString()} docs · ${r.model}</div>
+        <div class="run-meta">${r.completed.toLocaleString()} docs · ${r.model} · temp=${r.temperature}</div>
         ${r.description ? `<div class="run-desc">${esc(r.description.substring(0, 100))}</div>` : ''}
         ${child}
       </div>
@@ -442,10 +449,16 @@ function getSelectedRuns() {
 function onRunSelectionChanged() {
   const runs = getSelectedRuns();
   mergedFeatures = {};
+  searchFeatureEntries = [];
   runs.forEach(rn => {
     const run = allRuns.find(r => r.run_name === rn);
     if (!run) return;
     Object.entries(run.features).forEach(([fn, fdef]) => {
+      // Per (feature, run) entry -- lets Search target one specific run's
+      // value even when another selected run defines the same feature name
+      // (e.g. comparing agreement between two runs on the same feature).
+      searchFeatureEntries.push({ feature: fn, ...fdef });
+
       if (!mergedFeatures[fn]) {
         mergedFeatures[fn] = { ...fdef };
       } else if (fdef.type === 'enum') {
@@ -456,6 +469,7 @@ function onRunSelectionChanged() {
       }
     });
   });
+  searchFeatureEntries.sort((a, b) => a.feature.localeCompare(b.feature) || a.run.localeCompare(b.run));
   renderFilters();
   document.getElementById('toolbar').style.display = runs.length ? 'flex' : 'none';
   renderChartFeaturePicker();
@@ -466,37 +480,44 @@ function onRunSelectionChanged() {
 // =======================================================================
 function renderFilters() {
   const area = document.getElementById('filterArea');
-  const entries = Object.entries(mergedFeatures);
-  if (!entries.length) {
+  if (!searchFeatureEntries.length) {
     area.innerHTML = '<div class="filter-empty">Select one or more runs to see available filters.</div>';
     return;
   }
-  area.innerHTML = entries.map(([fn, fd]) => {
+  // Only show a run tag when the same feature name is defined by more than
+  // one selected run -- otherwise it's just visual noise.
+  const nameCounts = {};
+  searchFeatureEntries.forEach(e => { nameCounts[e.feature] = (nameCounts[e.feature] || 0) + 1; });
+
+  area.innerHTML = searchFeatureEntries.map(e => {
+    const fn = e.feature, fd = e, rn = e.run;
+    const cardKey = `${fn}__${rn}`;
     const typeTag = `<span class="filter-type-tag tag-${fd.type}">${fd.type}</span>`;
+    const runTag = nameCounts[fn] > 1 ? `<span class="filter-run-tag">${esc(rn)}</span>` : '';
     let controls = '';
 
     if (fd.type === 'boolean') {
       controls = `
-        <label><input type="radio" name="filter_${fn}" value="any" checked> Any</label>
-        <label><input type="radio" name="filter_${fn}" value="present"> Present</label>
-        <label><input type="radio" name="filter_${fn}" value="absent"> Absent</label>`;
+        <label><input type="radio" name="filter_${esc(cardKey)}" value="any" checked> Any</label>
+        <label><input type="radio" name="filter_${esc(cardKey)}" value="present"> Present</label>
+        <label><input type="radio" name="filter_${esc(cardKey)}" value="absent"> Absent</label>`;
     } else if (fd.type === 'enum') {
       controls = (fd.options || []).map(o =>
-        `<label><input type="checkbox" data-feature="${esc(fn)}" data-enum-val="${esc((o == fd.options[0]) ? 'NULL' : o)}"> ${esc(o)}</label>`
+        `<label><input type="checkbox" data-feature="${esc(fn)}" data-run="${esc(rn)}" data-enum-val="${esc((o == fd.options[0]) ? 'NULL' : o)}"> ${esc(o)}</label>`
       ).join('');
     } else if (fd.type === 'text') {
-      controls = `<input type="text" placeholder="Search text..." data-feature="${esc(fn)}" data-text-search>`;
+      controls = `<input type="text" placeholder="Search text..." data-feature="${esc(fn)}" data-run="${esc(rn)}" data-text-search>`;
     } else if (fd.type === 'integer') {
       controls = `
-        <input type="number" placeholder="Min" data-feature="${esc(fn)}" data-int-min style="width:80px">
+        <input type="number" placeholder="Min" data-feature="${esc(fn)}" data-run="${esc(rn)}" data-int-min style="width:80px">
         <span style="color:var(--df-muted);font-size:.78rem">to</span>
-        <input type="number" placeholder="Max" data-feature="${esc(fn)}" data-int-max style="width:80px">`;
+        <input type="number" placeholder="Max" data-feature="${esc(fn)}" data-run="${esc(rn)}" data-int-max style="width:80px">`;
     }
 
     const desc = fd.description ? fd.description.replace(/\s+/g, ' ').substring(0, 150) : '';
     return `
-    <div class="filter-card" data-feature-name="${esc(fn)}">
-      <div class="filter-label">${esc(fn)} ${typeTag}</div>
+    <div class="filter-card" data-feature-name="${esc(fn)}" data-run="${esc(rn)}">
+      <div class="filter-label">${esc(fn)} ${typeTag} ${runTag}</div>
       ${desc ? `<div class="filter-desc">${esc(desc)}</div>` : ''}
       <div class="filter-controls">${controls}</div>
     </div>`;
@@ -505,26 +526,28 @@ function renderFilters() {
 
 function gatherFilters() {
   const filters = [];
-  Object.entries(mergedFeatures).forEach(([fn, fd]) => {
+  searchFeatureEntries.forEach(e => {
+    const fn = e.feature, fd = e, rn = e.run;
+    const cardKey = `${fn}__${rn}`;
     if (fd.type === 'boolean') {
-      const val = document.querySelector(`input[name="filter_${fn}"]:checked`)?.value;
-      if (val === 'present') filters.push({ feature: fn, run: fd.run, mode: 'present' });
-      else if (val === 'absent') filters.push({ feature: fn, run: fd.run, mode: 'absent' });
+      const val = document.querySelector(`input[name="filter_${CSS.escape(cardKey)}"]:checked`)?.value;
+      if (val === 'present') filters.push({ feature: fn, run: rn, mode: 'present' });
+      else if (val === 'absent') filters.push({ feature: fn, run: rn, mode: 'absent' });
     } else if (fd.type === 'enum') {
       const checked = Array.from(
-        document.querySelectorAll(`input[data-feature="${fn}"][data-enum-val]:checked`)
+        document.querySelectorAll(`input[data-feature="${CSS.escape(fn)}"][data-run="${CSS.escape(rn)}"][data-enum-val]:checked`)
       ).map(i => i.dataset.enumVal);
-      if (checked.length) filters.push({ feature: fn, run: fd.run, mode: 'enum_any', values: checked });
+      if (checked.length) filters.push({ feature: fn, run: rn, mode: 'enum_any', values: checked });
     } else if (fd.type === 'text') {
-      const input = document.querySelector(`input[data-feature="${fn}"][data-text-search]`);
-      if (input?.value.trim()) filters.push({ feature: fn, run: fd.run, mode: 'text_search', search: input.value.trim() });
+      const input = document.querySelector(`input[data-feature="${CSS.escape(fn)}"][data-run="${CSS.escape(rn)}"][data-text-search]`);
+      if (input?.value.trim()) filters.push({ feature: fn, run: rn, mode: 'text_search', search: input.value.trim() });
     } else if (fd.type === 'integer') {
-      const minEl = document.querySelector(`input[data-feature="${fn}"][data-int-min]`);
-      const maxEl = document.querySelector(`input[data-feature="${fn}"][data-int-max]`);
+      const minEl = document.querySelector(`input[data-feature="${CSS.escape(fn)}"][data-run="${CSS.escape(rn)}"][data-int-min]`);
+      const maxEl = document.querySelector(`input[data-feature="${CSS.escape(fn)}"][data-run="${CSS.escape(rn)}"][data-int-max]`);
       const minV = minEl?.value !== '' ? parseInt(minEl.value) : null;
       const maxV = maxEl?.value !== '' ? parseInt(maxEl.value) : null;
       if (minV !== null || maxV !== null) {
-        filters.push({ feature: fn, run: fd.run, mode: 'int_range', min: minV, max: maxV });
+        filters.push({ feature: fn, run: rn, mode: 'int_range', min: minV, max: maxV });
       }
     }
   });

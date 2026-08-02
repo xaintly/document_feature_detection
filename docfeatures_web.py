@@ -528,7 +528,7 @@ def api_runs():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT r.run_name, r.description, r.config_yaml,
-                       r.llm_model, r.created_at,
+                       r.llm_model, r.llm_temperature, r.created_at,
                        COUNT(d.doc_id) AS total_docs,
                        SUM(CASE WHEN d.status='complete' THEN 1 ELSE 0 END)
                            AS completed
@@ -558,6 +558,7 @@ def api_runs():
                     "run_name": row["run_name"],
                     "description": row["description"] or "",
                     "model": row["llm_model"] or "",
+                    "temperature": row["llm_temperature"] if row["llm_temperature"] is not None else 0.0,
                     "created_at": str(row["created_at"]),
                     "total_docs": row["total_docs"] or 0,
                     "completed": int(row["completed"] or 0),

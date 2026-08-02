@@ -79,7 +79,7 @@ def get_connection():
         autocommit=True,
     )
 
-def get_or_create_run(conn, run_name, config, config_hash, host, model):
+def get_or_create_run(conn, run_name, config, config_hash, host, model, temperature):
     with conn.cursor() as cur:
         cur.execute("SELECT run_name FROM runs WHERE run_name = %s", (run_name,))
         if cur.fetchone():
@@ -87,8 +87,8 @@ def get_or_create_run(conn, run_name, config, config_hash, host, model):
         desc = config.get("run_description", "")
         cur.execute(
             "INSERT INTO runs (run_name, config_hash, config_yaml, "
-            "description, llm_host, llm_model) VALUES (%s,%s,%s,%s,%s,%s)",
-            (run_name, config_hash, yaml.dump(config), desc, host, model),
+            "description, llm_host, llm_model, llm_temperature) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (run_name, config_hash, yaml.dump(config), desc, host, model, temperature),
         )
 
 
@@ -402,7 +402,7 @@ def mark_document(conn, doc_id, status, elapsed=None, error=None):
 def list_runs_db(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT r.run_name, r.description, r.llm_model, r.created_at,
+            SELECT r.run_name, r.description, r.llm_model, r.llm_temperature, r.created_at,
                    COUNT(d.doc_id)                       AS total_docs,
                    SUM(CASE WHEN d.status='complete' THEN 1 ELSE 0 END) AS completed,
                    SUM(CASE WHEN d.status='error'    THEN 1 ELSE 0 END) AS errors
@@ -661,7 +661,7 @@ class LLMServerDead(Exception):
     pass
 
 
-def call_llm(host, model, prompt):
+def call_llm(host, model, prompt, temperature=0.0):
     """Send prompt to llama-server with retry on transient errors.
 
     - 502/503: server restarting → retry up to RETRY_MAX_ATTEMPTS
@@ -672,7 +672,7 @@ def call_llm(host, model, prompt):
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
+        "temperature": temperature,
         # "max_completion_tokens": 2048,
     }
 
@@ -801,6 +801,28 @@ def parse_json_response(raw):
 # Feature Merging (across chunks)
 # ===========================================================================
 
+def validate_enum_values(parsed, features_config, chunk_info=None):
+    """Raise ValueError if any enum feature in a single chunk's parsed
+    response isn't one of its declared options (case-insensitive). LLMs
+    occasionally hallucinate an option that was never offered; catching it
+    here fails the document fast (before spending more LLM calls on it)
+    instead of letting merge_chunk_results silently store the made-up
+    value. Booleans/text/integers aren't validated -- this hasn't been an
+    observed problem for those types.
+    """
+    where = f" (chunk {chunk_info[0]}/{chunk_info[1]})" if chunk_info else ""
+    for name, fdef in features_config.items():
+        if fdef.get("type", "boolean") != "enum" or name not in parsed:
+            continue
+        value = parsed[name]
+        options = fdef.get("options", [])
+        if str(value).strip().lower() not in [o.lower() for o in options]:
+            raise ValueError(
+                f"Feature '{name}'{where}: LLM returned {value!r}, which is "
+                f"not one of the declared options {options}"
+            )
+
+
 def merge_chunk_results(chunk_jsons, features_config):
     """Combine per-chunk extractions into a single feature dict.
 
@@ -836,7 +858,7 @@ def merge_chunk_results(chunk_jsons, features_config):
         elif ftype == "enum":
             options = [o.lower() for o in fdef.get("options", [])]
             best_idx = -1
-            best_val = str(values[0])
+            best_val = None
             for v in values:
                 v_lower = str(v).lower().strip()
                 if v_lower in options:
@@ -844,6 +866,16 @@ def merge_chunk_results(chunk_jsons, features_config):
                     if idx > best_idx:
                         best_idx = idx
                         best_val = fdef["options"][idx]
+            if best_val is None:
+                # Every chunk's value was outside the declared options.
+                # validate_enum_values() should already have caught this
+                # per-chunk and aborted the document; this is a safety net,
+                # not the primary check -- never silently store a made-up
+                # value.
+                raise ValueError(
+                    f"Feature '{name}': none of the LLM's returned values "
+                    f"{values!r} match the declared options {fdef.get('options', [])}"
+                )
             merged[name] = best_val
 
         elif ftype == "text":
@@ -955,11 +987,15 @@ def process_corpus(args, config):
     features_config = config["features"]
     host = args.host or config.get("llm", {}).get("host", DEFAULT_LLM_HOST)
     model = args.model or config.get("llm", {}).get("model", DEFAULT_LLM_MODEL)
+    temperature = (
+        args.temperature if args.temperature is not None
+        else config.get("llm", {}).get("temperature", 0.0)
+    )
 
     conn = get_connection()
 
     config_hash = hashlib.sha256(yaml.dump(config).encode()).hexdigest()
-    get_or_create_run(conn, args.run_name, config, config_hash, host, model)
+    get_or_create_run(conn, args.run_name, config, config_hash, host, model, temperature)
     cleanup_incomplete(conn, args.run_name)
 
     skip_errors = not args.retry_errors
@@ -1012,7 +1048,7 @@ def process_corpus(args, config):
     print(f"Matched      : {len(all_files)}", file=sys.stderr)
     print(f"Already done : {len(finished)}", file=sys.stderr)
     print(f"Pending      : {len(pending)}", file=sys.stderr)
-    print(f"LLM          : {model} @ {host}", file=sys.stderr)
+    print(f"LLM          : {model} @ {host}  (temperature={temperature})", file=sys.stderr)
     if args.limit:
         pending = pending[: args.limit]
         print(f"Batch limit  : {args.limit}", file=sys.stderr)
@@ -1060,9 +1096,10 @@ def process_corpus(args, config):
                     continue  # skip empty chunks (e.g., pure HTML boilerplate)
                 chunk_info = (ci + 1, num_chunks) if num_chunks > 1 else None
                 prompt = build_prompt(features_config, clean_chunk, chunk_info)
-                raw = call_llm(host, model, prompt)
+                raw = call_llm(host, model, prompt, temperature)
                 parsed = parse_json_response(raw)
                 save_chunk_result(conn, doc_id, ci, json.dumps(parsed))
+                validate_enum_values(parsed, features_config, chunk_info)
                 chunk_results_list.append(parsed)
 
             if _interrupted:
@@ -1218,6 +1255,12 @@ examples:
         "-m", "--model",
         help=f"Model name (default: from config or '{DEFAULT_LLM_MODEL}')",
     )
+    parser.add_argument(
+        "--temperature", type=float, default=None,
+        help="LLM sampling temperature (default: 0.0, or from config's "
+             "llm.temperature). Use >0 to check agreement across repeated "
+             "runs of the same model.",
+    )
 
     # Management commands
     parser.add_argument(
@@ -1238,13 +1281,14 @@ examples:
             print("No runs found.")
             return
         print(
-            f"{'Run Name':<30} {'Model':<20} "
+            f"{'Run Name':<30} {'Model':<20} {'Temp':>5} "
             f"{'Done':>6} {'Errs':>5} {'Total':>6}  Created"
         )
         print("-" * 100)
         for r in runs:
             print(
                 f"{r['run_name']:<30} {(r['llm_model'] or '?'):<20} "
+                f"{r['llm_temperature'] if r['llm_temperature'] is not None else 0.0:>5.2f} "
                 f"{r['completed'] or 0:>6} {r['errors'] or 0:>5} "
                 f"{r['total_docs']:>6}  {r['created_at']}"
             )

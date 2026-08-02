@@ -51,6 +51,7 @@ TABLES = [
             description     TEXT,
             llm_host        VARCHAR(512),
             llm_model       VARCHAR(255),
+            llm_temperature FLOAT DEFAULT 0.0,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                                       ON UPDATE CURRENT_TIMESTAMP
@@ -132,6 +133,13 @@ INDEXES = [
     ("idx_df_feature_value", "document_features", "(feature_name, value_text(128))"),
     ("idx_doc_run_status", "document_runs", "(run_name, status)"),
     ("idx_file_hash", "files", "(file_hash)"),
+]
+
+# Additive columns for existing databases that predate a schema change.
+# (table, column, ALTER TABLE ... ADD COLUMN ... statement)
+COLUMNS = [
+    ("runs", "llm_temperature",
+     "ALTER TABLE runs ADD COLUMN llm_temperature FLOAT DEFAULT 0.0 AFTER llm_model"),
 ]
 
 
@@ -289,6 +297,14 @@ def do_check(db_name):
                 print(f"  ✗ Index '{iname}' on '{tname}' is missing.")
                 ok = False
 
+        # Check additive columns
+        for tname, cname, _ in COLUMNS:
+            if table_exists(cur, tname) and column_exists(cur, tname, cname):
+                print(f"  ✓ Column '{tname}.{cname}' exists")
+            elif table_exists(cur, tname):
+                print(f"  ✗ Column '{tname}.{cname}' is missing.")
+                ok = False
+
     conn.close()
     print()
     if ok:
@@ -343,6 +359,14 @@ def do_init(db_name):
                 print(f"  Index '{iname}' — creating on '{tname}'...")
                 cur.execute(f"CREATE INDEX {iname} ON {tname} {columns_sql}")
                 print(f"  Index '{iname}' — created")
+
+        for tname, cname, alter_sql in COLUMNS:
+            if column_exists(cur, tname, cname):
+                print(f"  Column '{tname}.{cname}' — already exists")
+            else:
+                print(f"  Column '{tname}.{cname}' — adding...")
+                cur.execute(alter_sql)
+                print(f"  Column '{tname}.{cname}' — added")
 
     conn.close()
     print()
