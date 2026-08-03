@@ -105,6 +105,12 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 .identity-logout { font-size: .72rem; margin-left: .4rem; }
 
 /* --- Verification (preview panel) --- */
+.preview-mode-toggle { display: flex; gap: .3rem; margin-bottom: .5rem; }
+.mode-toggle-btn {
+  font-size: .72rem; font-weight: 500; padding: .15rem .55rem; border-radius: 10px;
+  border: 1px solid var(--df-border); background: #fff; color: var(--df-muted); cursor: pointer;
+}
+.mode-toggle-btn.active { background: var(--df-accent); color: #fff; border-color: var(--df-accent); }
 .verify-list { display: flex; flex-direction: column; gap: .5rem; }
 .verify-row {
   background: #fff; border: 1px solid var(--df-border); border-radius: 6px;
@@ -430,6 +436,10 @@ let browsePath = '';
 let browseRun = '';
 let currentUser = null;         // reviewer identity for verification tracking
 let currentUserSource = null;   // 'header' (X-REMOTE-USER, authoritative) | 'local' (localStorage) | null
+let previewViewMode = 'view';   // 'view' (compact, like before) | 'verify' (editable rows) -- sticky across opens
+let lastPreviewData = null;
+let lastPreviewStored = [];
+let lastPreviewForcedFeatures = [];
 
 // =======================================================================
 // Init
@@ -545,6 +555,7 @@ async function handleVerifyClick(e) {
   const row = btn.closest('.verify-row');
   const docId = parseInt(row.dataset.docId, 10);
   const featureName = row.dataset.feature;
+  const runName = row.dataset.run;
   const select = row.querySelector('.verify-select');
   const value = select.value;
   const statusEl = row.querySelector('.verify-save-status');
@@ -572,14 +583,33 @@ async function handleVerifyClick(e) {
       statusEl.textContent = result.error;
       statusEl.style.color = '#ef4444';
     } else {
-      statusEl.textContent = '';
-      let note = row.querySelector('.verify-note');
-      if (!note) {
-        note = document.createElement('div');
-        note.className = 'verify-note';
-        row.querySelector('.verify-row-label').insertAdjacentElement('afterend', note);
+      // Update the cached preview state (not just this row's DOM) so that
+      // toggling View/Verify afterward -- which re-renders from the cache,
+      // not a re-fetch -- still reflects this verification.
+      lastPreviewData.verifications = lastPreviewData.verifications || {};
+      const key = `${docId}:${featureName}`;
+      lastPreviewData.verifications[key] = {
+        original_value: lastPreviewData.verifications[key]?.original_value ?? null,
+        verified_value: result.verified_value,
+        verified_by: result.verified_by,
+        verified_at: 'just now',
+      };
+
+      const fdef = resolveFeatureConfig(runName, featureName);
+      const isDefault = fdef?.type === 'boolean'
+        ? result.verified_value === 'False'
+        : fdef?.options?.[0] === result.verified_value;
+      const idx = lastPreviewStored.findIndex(f => f.docId === docId && f.name === featureName);
+      if (isDefault) {
+        if (idx !== -1) lastPreviewStored.splice(idx, 1);
+      } else if (idx !== -1) {
+        lastPreviewStored[idx].value = result.verified_value;
+      } else {
+        lastPreviewStored.push({ name: featureName, value: result.verified_value, run: runName, docId });
       }
-      note.textContent = `✓ verified as ${result.verified_value} by ${result.verified_by} · just now`;
+
+      renderPreviewFeaturesBody();
+      return;
     }
   } catch (err) {
     statusEl.textContent = 'Save failed.';
@@ -1236,8 +1266,6 @@ function resolveFeatureConfig(runName, featureName) {
 }
 
 function renderPreviewPanel(data, forcedFeatures) {
-  const el = document.getElementById('previewFeatures');
-
   // Flat list of every STORED (non-default) feature value across this run
   // and every other run, each tagged with which run/doc_id produced it.
   const stored = [];
@@ -1246,23 +1274,75 @@ function renderPreviewPanel(data, forcedFeatures) {
     feats.forEach(f => stored.push({ ...f, run: rn, docId: (data.other_run_doc_ids || {})[rn] }));
   });
 
-  // Boolean/enum features get an interactive verify row; everything else
-  // (text/integer) is shown read-only, same as before.
-  const verifiableRows = buildVerifiableFeatureRows(data, stored, forcedFeatures);
-  const verifiableKeys = new Set(verifiableRows.map(r => `${r.docId}:${r.name}`));
-  const readOnly = stored.filter(f => !verifiableKeys.has(`${f.docId}:${f.name}`));
-
-  let html = '';
-  if (readOnly.length) {
-    readOnly.sort((a, b) => a.name.localeCompare(b.name));
-    html += '<div class="feature-badges" style="margin-bottom:.6rem">';
-    html += readOnly.map(f => badgeHTML(f.name, f.value, resolveFeatureConfig(f.run, f.name))).join('');
-    html += '</div>';
-  }
-  html += renderVerifiableFeaturesHTML(verifiableRows);
-  el.innerHTML = html || '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
+  lastPreviewData = data;
+  lastPreviewStored = stored;
+  lastPreviewForcedFeatures = forcedFeatures;
+  renderPreviewFeaturesBody();
 
   return stored.find(f => f.name.match(/summary/i));
+}
+
+// Re-renders the features panel from the last-loaded preview data, without
+// re-fetching -- used both on initial load and when the View/Verify toggle
+// is flipped.
+function renderPreviewFeaturesBody() {
+  const el = document.getElementById('previewFeatures');
+  const data = lastPreviewData;
+  if (!data) return;
+  const stored = lastPreviewStored;
+
+  const toggleHTML = `
+    <div class="preview-mode-toggle">
+      <button class="mode-toggle-btn ${previewViewMode === 'view' ? 'active' : ''}" onclick="setPreviewMode('view')">View</button>
+      <button class="mode-toggle-btn ${previewViewMode === 'verify' ? 'active' : ''}" onclick="setPreviewMode('verify')">Verify</button>
+    </div>`;
+
+  let bodyHTML;
+  if (previewViewMode === 'view') {
+    // Collapsed view, like before: only stored (non-default) values,
+    // sorted flat. Text feature values are hover-only to save space.
+    const sorted = stored.slice().sort((a, b) => a.name.localeCompare(b.name));
+    bodyHTML = sorted.length
+      ? '<div class="feature-badges">'
+        + sorted.map(f => compactBadgeHTML(f.name, f.value, resolveFeatureConfig(f.run, f.name))).join('')
+        + '</div>'
+      : '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
+  } else {
+    // Boolean/enum features get an interactive verify row (including
+    // synthesized defaults from the active search); everything else
+    // (text/integer) stays read-only.
+    const verifiableRows = buildVerifiableFeatureRows(data, stored, lastPreviewForcedFeatures);
+    const verifiableKeys = new Set(verifiableRows.map(r => `${r.docId}:${r.name}`));
+    const readOnly = stored.filter(f => !verifiableKeys.has(`${f.docId}:${f.name}`));
+
+    bodyHTML = '';
+    if (readOnly.length) {
+      readOnly.sort((a, b) => a.name.localeCompare(b.name));
+      bodyHTML += '<div class="feature-badges" style="margin-bottom:.6rem">';
+      bodyHTML += readOnly.map(f => compactBadgeHTML(f.name, f.value, resolveFeatureConfig(f.run, f.name))).join('');
+      bodyHTML += '</div>';
+    }
+    bodyHTML += renderVerifiableFeaturesHTML(verifiableRows)
+      || '<div style="color:var(--df-muted);font-size:.78rem">No boolean/enum features found.</div>';
+  }
+
+  el.innerHTML = toggleHTML + bodyHTML;
+}
+
+function setPreviewMode(mode) {
+  previewViewMode = mode;
+  renderPreviewFeaturesBody();
+}
+
+// Like badgeHTML, but text feature values are hover-only (via title) --
+// text values (e.g. a generated summary) can be long and take up a lot of
+// vertical room shown inline across many documents.
+function compactBadgeHTML(name, value, config) {
+  const type = config?.type || 'boolean';
+  if (type === 'text') {
+    return `<span class="fbadge fbadge-text" title="${esc(value || '')}">${esc(name)}</span>`;
+  }
+  return badgeHTML(name, value, config);
 }
 
 function buildVerifiableFeatureRows(data, stored, forcedFeatures) {
@@ -1320,7 +1400,7 @@ function renderVerifiableFeaturesHTML(rows) {
       ? `<div class="verify-note">✓ verified as <b>${esc(r.verification.verified_value)}</b> by ${esc(r.verification.verified_by || '?')} · ${esc(r.verification.verified_at)}</div>`
       : '';
     return `
-    <div class="verify-row" data-doc-id="${r.docId}" data-feature="${esc(r.name)}">
+    <div class="verify-row" data-doc-id="${r.docId}" data-feature="${esc(r.name)}" data-run="${esc(r.run)}">
       <div class="verify-row-label">
         ${esc(r.name)} ${typeTag} ${runTag}
         <span class="fbadge-val">current: ${esc(r.value)}</span>
