@@ -127,6 +127,24 @@ TABLES = [
         )
         """,
     ),
+    (
+        "feature_verifications",
+        """
+        CREATE TABLE IF NOT EXISTS feature_verifications (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            doc_id          INT NOT NULL,
+            feature_name    VARCHAR(255) NOT NULL,
+            original_value  VARCHAR(1024),
+            verified_value  VARCHAR(1024) NOT NULL,
+            verified_by     VARCHAR(255),
+            verified_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                      ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_doc_feature (doc_id, feature_name),
+            FOREIGN KEY (doc_id) REFERENCES document_runs(doc_id)
+                ON DELETE CASCADE
+        )
+        """,
+    ),
 ]
 
 INDEXES = [

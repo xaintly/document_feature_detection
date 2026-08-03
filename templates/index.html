@@ -98,6 +98,25 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 }
 .mode-tab:hover { color: #1e293b; }
 .mode-tab.active { color: var(--df-accent-dark); border-bottom-color: var(--df-accent); }
+.identity-banner {
+  font-size: .78rem; color: var(--df-muted); align-self: center; padding-bottom: .5rem;
+  cursor: default;
+}
+.identity-logout { font-size: .72rem; margin-left: .4rem; }
+
+/* --- Verification (preview panel) --- */
+.verify-list { display: flex; flex-direction: column; gap: .5rem; }
+.verify-row {
+  background: #fff; border: 1px solid var(--df-border); border-radius: 6px;
+  padding: .5rem .6rem; font-size: .8rem;
+}
+.verify-row-label { display: flex; align-items: center; flex-wrap: wrap; gap: .3rem; }
+.verify-row-label .fbadge-val { font-size: .72rem; color: var(--df-muted); margin-left: .3rem; }
+.verify-row-implied { font-size: .65rem; color: var(--df-muted); font-style: italic; }
+.verify-note { font-size: .72rem; color: #065f46; margin-top: .25rem; }
+.verify-row-controls { display: flex; align-items: center; gap: .4rem; margin-top: .35rem; }
+.verify-select { font-size: .78rem; padding: .15rem .35rem; border: 1px solid var(--df-border); border-radius: 4px; }
+.verify-save-status { font-size: .72rem; color: var(--df-muted); }
 
 /* --- Browse mode --- */
 .browse-toolbar { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
@@ -195,7 +214,7 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
 .modal-xl-custom { max-width: 900px; }
 .preview-features {
   background: #f8fafc; border-bottom: 1px solid var(--df-border);
-  padding: .75rem 1rem; max-height: 180px; overflow-y: auto;
+  padding: .75rem 1rem; max-height: 320px; overflow-y: auto;
 }
 .preview-features h6 {
   font-size: .7rem; font-weight: 600; text-transform: uppercase;
@@ -240,6 +259,8 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
     <button class="mode-tab active" id="tabSearch" onclick="switchMode('search')">🔍 Search</button>
     <button class="mode-tab" id="tabBrowse" onclick="switchMode('browse')">📁 Browse</button>
     <button class="mode-tab" id="tabCharts" onclick="switchMode('charts')">📊 Charts</button>
+    <div style="flex:1"></div>
+    <div class="identity-banner" id="identityBanner"></div>
   </div>
 
   <div id="searchPanel">
@@ -370,6 +391,27 @@ body { background: var(--df-bg); margin: 0; min-height: 100vh; display: flex; }
   </div>
 </div>
 
+<!-- Reviewer Name Modal -->
+<div class="modal fade" id="nameModal" tabindex="-1">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title" style="font-size:.85rem">Your name</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:.8rem;color:var(--df-muted)">Used to track who verified each feature. Remembered on this device.</p>
+        <input type="text" class="form-control form-control-sm" id="nameModalInput" placeholder="Your name"
+               onkeydown="if(event.key==='Enter'){document.getElementById('nameModalSaveBtn').click();}">
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-primary" id="nameModalSaveBtn">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
 <script>
@@ -386,11 +428,14 @@ let lastSQL = '';
 let currentPage = 1;
 let browsePath = '';
 let browseRun = '';
+let currentUser = null;         // reviewer identity for verification tracking
+let currentUserSource = null;   // 'header' (X-REMOTE-USER, authoritative) | 'local' (localStorage) | null
 
 // =======================================================================
 // Init
 // =======================================================================
 document.addEventListener('DOMContentLoaded', loadRuns);
+document.addEventListener('DOMContentLoaded', initIdentity);
 document.addEventListener('DOMContentLoaded', () => {
   // Event delegation for browse rows/breadcrumb crumbs: file and folder
   // names come from user-submitted corpus content, so we read them via
@@ -398,6 +443,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // interpolating them into inline onclick="..." JS string literals.
   document.getElementById('browseListing').addEventListener('click', handleBrowseClick);
   document.getElementById('browseBreadcrumb').addEventListener('click', handleBrowseClick);
+  // Same reasoning for verify controls in the preview panel.
+  document.getElementById('previewFeatures').addEventListener('click', handleVerifyClick);
 });
 
 function handleBrowseClick(e) {
@@ -405,6 +452,141 @@ function handleBrowseClick(e) {
   if (folderEl) { loadBrowse(folderEl.dataset.browseFolder); return; }
   const docEl = e.target.closest('[data-browse-doc]');
   if (docEl) { openPreview(parseInt(docEl.dataset.browseDoc, 10)); }
+}
+
+// =======================================================================
+// Identity (for verification tracking)
+// =======================================================================
+async function initIdentity() {
+  try {
+    const resp = await fetch('/api/whoami');
+    const data = await resp.json();
+    if (data.user) {
+      currentUser = data.user;
+      currentUserSource = 'header';
+    } else {
+      const stored = localStorage.getItem('docfeatures_reviewer_name');
+      if (stored) {
+        currentUser = stored;
+        currentUserSource = 'local';
+      }
+    }
+  } catch (e) { /* identity banner just shows "not identified" */ }
+  renderIdentityBanner();
+}
+
+function renderIdentityBanner() {
+  const el = document.getElementById('identityBanner');
+  if (currentUser) {
+    const logout = currentUserSource === 'local'
+      ? ` · <a href="#" class="identity-logout" onclick="logoutIdentity();return false;">log out</a>`
+      : '';
+    el.innerHTML = `<span title="Logged in as ${esc(currentUser)}">● Logged in</span>${logout}`;
+  } else {
+    el.innerHTML = `<span title="You'll be asked for a name the first time you verify a feature">○ Not identified</span>`;
+  }
+}
+
+function logoutIdentity() {
+  localStorage.removeItem('docfeatures_reviewer_name');
+  currentUser = null;
+  currentUserSource = null;
+  renderIdentityBanner();
+}
+
+// Resolves with an identity name (prompting once, if needed), or null if
+// the user cancels the prompt.
+async function ensureIdentity() {
+  if (currentUser) return currentUser;
+  const name = await promptForName();
+  if (!name) return null;
+  localStorage.setItem('docfeatures_reviewer_name', name);
+  currentUser = name;
+  currentUserSource = 'local';
+  renderIdentityBanner();
+  return name;
+}
+
+function promptForName() {
+  return new Promise(resolve => {
+    const modalEl = document.getElementById('nameModal');
+    const input = document.getElementById('nameModalInput');
+    const saveBtn = document.getElementById('nameModalSaveBtn');
+    input.value = '';
+    const modal = new bootstrap.Modal(modalEl);
+
+    function cleanup() {
+      saveBtn.removeEventListener('click', onSave);
+      modalEl.removeEventListener('hidden.bs.modal', onHidden);
+    }
+    function onSave() {
+      const v = input.value.trim();
+      cleanup();
+      modal.hide();
+      resolve(v || null);
+    }
+    function onHidden() {
+      cleanup();
+      resolve(null);
+    }
+    saveBtn.addEventListener('click', onSave);
+    modalEl.addEventListener('hidden.bs.modal', onHidden);
+    modal.show();
+    setTimeout(() => input.focus(), 300);
+  });
+}
+
+// =======================================================================
+// Verification (preview panel)
+// =======================================================================
+async function handleVerifyClick(e) {
+  const btn = e.target.closest('.verify-save-btn');
+  if (!btn) return;
+  const row = btn.closest('.verify-row');
+  const docId = parseInt(row.dataset.docId, 10);
+  const featureName = row.dataset.feature;
+  const select = row.querySelector('.verify-select');
+  const value = select.value;
+  const statusEl = row.querySelector('.verify-save-status');
+
+  const user = await ensureIdentity();
+  if (!user) {
+    statusEl.textContent = 'Cancelled -- no reviewer name given.';
+    statusEl.style.color = '#ef4444';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.style.color = 'var(--df-muted)';
+  statusEl.textContent = 'Saving...';
+  try {
+    const resp = await fetch('/api/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        doc_id: docId, feature_name: featureName, verified_value: value, verified_by: user,
+      }),
+    });
+    const result = await resp.json();
+    if (result.error) {
+      statusEl.textContent = result.error;
+      statusEl.style.color = '#ef4444';
+    } else {
+      statusEl.textContent = '';
+      let note = row.querySelector('.verify-note');
+      if (!note) {
+        note = document.createElement('div');
+        note.className = 'verify-note';
+        row.querySelector('.verify-row-label').insertAdjacentElement('afterend', note);
+      }
+      note.textContent = `✓ verified as ${result.verified_value} by ${result.verified_by} · just now`;
+    }
+  } catch (err) {
+    statusEl.textContent = 'Save failed.';
+    statusEl.style.color = '#ef4444';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function loadRuns() {
@@ -913,7 +1095,7 @@ function renderResults(data) {
     const badges = (r.features || []).map(f => badgeHTML(f.name, f.value, configs[f.name])).join('');
     const size = r.file_size ? `<span style="color:var(--df-muted);font-size:.7rem">${fmtSize(r.file_size)}</span>` : '';
     return `
-    <tr onclick="openPreview(${r.doc_id})">
+    <tr onclick="openPreviewFromSearch(${r.doc_id})">
       <td class="cell-path">${esc(r.display_path)} ${size}</td>
       <td class="cell-run">${esc(r.run_name)}</td>
       <td><div class="feature-badges">${badges}</div></td>
@@ -985,7 +1167,17 @@ function paginationHTML(data) {
 // =======================================================================
 // Document Preview
 // =======================================================================
-async function openPreview(docId) {
+function openPreviewFromSearch(docId) {
+  // Carry the active search's filter features into the preview, so
+  // features searched in their default state (boolean absent, enum first
+  // option) -- which never get a document_features row and so wouldn't
+  // otherwise show up -- are still shown and made verifiable.
+  const forced = (lastSearchPayload?.filters || []).map(f => ({ feature: f.feature, run: f.run }));
+  openPreview(docId, forced);
+}
+
+async function openPreview(docId, forcedFeatures) {
+  forcedFeatures = forcedFeatures || [];
   const modal = new bootstrap.Modal(document.getElementById('previewModal'));
   document.getElementById('previewTitle').textContent = 'Loading...';
   document.getElementById('previewFeatures').innerHTML = '<div class="spinner"></div>';
@@ -1007,7 +1199,7 @@ async function openPreview(docId) {
     document.getElementById('previewTitle').textContent = fname;
 
     // Features panel
-    const summary = renderPreviewFeaturesFlat(featData);
+    const summary = renderPreviewPanel(featData, forcedFeatures);
     const summaryHTML = summary ? '<div style="font-size: -1; font-style: italic; color: #64748b;">' + summary.value + '</div>' : null;
 
     // Content
@@ -1035,57 +1227,113 @@ async function openPreview(docId) {
   }
 }
 
-function renderPreviewFeaturesFlat(data) {
-  const el = document.getElementById('previewFeatures');
-  let flat_features = [];
-  let html = '';
-
-  // This run's features
-  if (data.features?.length) flat_features.push(...data.features);
-  if (data.other_runs && Object.keys(data.other_runs).length) {
-    Object.entries(data.other_runs).forEach(([rn, feats]) => {
-      flat_features.push(...feats);
-    });
-  }
-  
-  if (flat_features.length) {
-    flat_features.sort((a,b) => a.name.localeCompare(b.name));
-    html += '<div class="feature-badges" style="margin-bottom:.5rem">';
-    html += flat_features.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
-    html += '</div>';
-  }
-
-  if (!html) html = '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
-  el.innerHTML = html;
-  
-  return flat_features.find((feature) => feature.name.match(/summary/i));
+// Looks up a feature's config (type/options) from the run it actually
+// belongs to -- not the sidebar's merged view, since preview can show
+// features from runs that aren't even selected there (Browse mode, or
+// "other runs" of the same file).
+function resolveFeatureConfig(runName, featureName) {
+  return allRuns.find(r => r.run_name === runName)?.features?.[featureName];
 }
 
-function renderPreviewFeatures(data) {
+function renderPreviewPanel(data, forcedFeatures) {
   const el = document.getElementById('previewFeatures');
-  console.log(data)
-  let html = '';
 
-  // This run's features
-  if (data.features?.length) {
-    html += `<h6>${esc(data.run_name)}</h6>`;
-    html += '<div class="feature-badges" style="margin-bottom:.5rem">';
-    html += data.features.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
+  // Flat list of every STORED (non-default) feature value across this run
+  // and every other run, each tagged with which run/doc_id produced it.
+  const stored = [];
+  (data.features || []).forEach(f => stored.push({ ...f, run: data.run_name, docId: data.doc_id }));
+  Object.entries(data.other_runs || {}).forEach(([rn, feats]) => {
+    feats.forEach(f => stored.push({ ...f, run: rn, docId: (data.other_run_doc_ids || {})[rn] }));
+  });
+
+  // Boolean/enum features get an interactive verify row; everything else
+  // (text/integer) is shown read-only, same as before.
+  const verifiableRows = buildVerifiableFeatureRows(data, stored, forcedFeatures);
+  const verifiableKeys = new Set(verifiableRows.map(r => `${r.docId}:${r.name}`));
+  const readOnly = stored.filter(f => !verifiableKeys.has(`${f.docId}:${f.name}`));
+
+  let html = '';
+  if (readOnly.length) {
+    readOnly.sort((a, b) => a.name.localeCompare(b.name));
+    html += '<div class="feature-badges" style="margin-bottom:.6rem">';
+    html += readOnly.map(f => badgeHTML(f.name, f.value, resolveFeatureConfig(f.run, f.name))).join('');
     html += '</div>';
   }
+  html += renderVerifiableFeaturesHTML(verifiableRows);
+  el.innerHTML = html || '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
 
-  // Other runs
-  if (data.other_runs && Object.keys(data.other_runs).length) {
-    Object.entries(data.other_runs).forEach(([rn, feats]) => {
-      html += `<h6>${esc(rn)}</h6>`;
-      html += '<div class="feature-badges" style="margin-bottom:.5rem">';
-      html += feats.map(f => badgeHTML(f.name, f.value, mergedFeatures[f.name])).join('');
-      html += '</div>';
+  return stored.find(f => f.name.match(/summary/i));
+}
+
+function buildVerifiableFeatureRows(data, stored, forcedFeatures) {
+  const rows = [];
+  const seen = new Set();
+
+  stored.forEach(f => {
+    const fdef = resolveFeatureConfig(f.run, f.name);
+    if (!fdef || (fdef.type !== 'boolean' && fdef.type !== 'enum')) return;
+    seen.add(`${f.docId}:${f.name}`);
+    rows.push({
+      name: f.name, run: f.run, docId: f.docId,
+      type: fdef.type, options: fdef.options || [], value: f.value, isDefault: false,
     });
-  }
+  });
 
-  if (!html) html = '<div style="color:var(--df-muted);font-size:.78rem">No features found.</div>';
-  el.innerHTML = html;
+  // Features searched in their default state (boolean absent, enum first
+  // option) never get a document_features row -- synthesize one so they're
+  // visible and verifiable too.
+  (forcedFeatures || []).forEach(({ feature, run }) => {
+    if (!feature || !run) return;
+    const docId = run === data.run_name ? data.doc_id : (data.other_run_doc_ids || {})[run];
+    if (docId == null) return;
+    const key = `${docId}:${feature}`;
+    if (seen.has(key)) return;
+    const fdef = resolveFeatureConfig(run, feature);
+    if (!fdef || (fdef.type !== 'boolean' && fdef.type !== 'enum')) return;
+    seen.add(key);
+    const defaultVal = fdef.type === 'boolean' ? 'False' : (fdef.options?.[0] ?? '');
+    rows.push({
+      name: feature, run, docId,
+      type: fdef.type, options: fdef.options || [], value: defaultVal, isDefault: true,
+    });
+  });
+
+  rows.forEach(r => {
+    r.verification = (data.verifications || {})[`${r.docId}:${r.name}`] || null;
+  });
+  rows.sort((a, b) => a.name.localeCompare(b.name) || a.run.localeCompare(b.run));
+  return rows;
+}
+
+function renderVerifiableFeaturesHTML(rows) {
+  if (!rows.length) return '';
+  return '<div class="verify-list">' + rows.map(r => {
+    const typeTag = `<span class="filter-type-tag tag-${r.type}">${r.type}</span>`;
+    const runTag = `<span class="filter-run-tag">${esc(r.run)}</span>`;
+    const optionsList = r.type === 'boolean' ? ['True', 'False'] : r.options;
+    const selectOptions = optionsList.map(o =>
+      `<option value="${esc(o)}" ${o === r.value ? 'selected' : ''}>${esc(o)}</option>`
+    ).join('');
+    const impliedNote = r.isDefault
+      ? '<span class="verify-row-implied">(implied default, not stored)</span>' : '';
+    const verifiedNote = r.verification
+      ? `<div class="verify-note">✓ verified as <b>${esc(r.verification.verified_value)}</b> by ${esc(r.verification.verified_by || '?')} · ${esc(r.verification.verified_at)}</div>`
+      : '';
+    return `
+    <div class="verify-row" data-doc-id="${r.docId}" data-feature="${esc(r.name)}">
+      <div class="verify-row-label">
+        ${esc(r.name)} ${typeTag} ${runTag}
+        <span class="fbadge-val">current: ${esc(r.value)}</span>
+        ${impliedNote}
+      </div>
+      ${verifiedNote}
+      <div class="verify-row-controls">
+        <select class="verify-select">${selectOptions}</select>
+        <button class="btn btn-sm btn-outline-primary verify-save-btn">✓ Verify</button>
+        <span class="verify-save-status"></span>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
 }
 
 // =======================================================================

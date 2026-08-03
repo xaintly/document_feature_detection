@@ -521,6 +521,17 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/whoami")
+def api_whoami():
+    """Identity for verification tracking. X-REMOTE-USER (set by an
+    upstream auth frontend, e.g. Apache) is authoritative when present;
+    otherwise the client falls back to a locally-remembered name."""
+    header_user = request.headers.get("X-REMOTE-USER", "").strip()
+    if header_user:
+        return jsonify({"user": header_user, "source": "header"})
+    return jsonify({"user": None, "source": None})
+
+
 @app.route("/api/runs")
 def api_runs():
     conn = get_db()
@@ -757,9 +768,24 @@ def api_document_features(doc_id):
             )
             doc = cur.fetchone()
 
-            # Also get features from other runs of the same file -- a plain
-            # file_id filter now, no file_path self-join needed.
+            other_runs = {}
+            other_run_doc_ids = {}
             if doc:
+                # Every other complete run's doc_id for this same file --
+                # queried independently of document_features, so a run
+                # with zero non-default values for this file still gets a
+                # doc_id a verify request can target.
+                cur.execute(
+                    "SELECT run_name, doc_id FROM document_runs "
+                    "WHERE file_id = %s AND doc_id != %s AND status = 'complete'",
+                    (doc["file_id"], doc_id),
+                )
+                for r in cur.fetchall():
+                    other_run_doc_ids[r["run_name"]] = r["doc_id"]
+                    other_runs.setdefault(r["run_name"], [])
+
+                # Non-default stored values from other runs -- a plain
+                # file_id filter, no file_path self-join needed.
                 cur.execute(
                     "SELECT dr.run_name, df.feature_name, df.value_text "
                     "FROM document_features df "
@@ -769,13 +795,30 @@ def api_document_features(doc_id):
                     "ORDER BY dr.run_name, df.feature_name",
                     (doc["file_id"], doc_id),
                 )
-                other_runs = {}
                 for r in cur.fetchall():
                     other_runs.setdefault(r["run_name"], []).append(
                         {"name": r["feature_name"], "value": r["value_text"]}
                     )
-            else:
-                other_runs = {}
+
+            # Verification records for the primary doc + every other-run
+            # doc -- independent of whether a document_features row exists,
+            # since a verified default (e.g. confirmed False) never gets one.
+            all_doc_ids = [doc_id] + list(other_run_doc_ids.values())
+            verifications = {}
+            ph = ", ".join(["%s"] * len(all_doc_ids))
+            cur.execute(
+                f"SELECT doc_id, feature_name, original_value, verified_value, "
+                f"verified_by, verified_at FROM feature_verifications "
+                f"WHERE doc_id IN ({ph})",
+                all_doc_ids,
+            )
+            for r in cur.fetchall():
+                verifications[f"{r['doc_id']}:{r['feature_name']}"] = {
+                    "original_value": r["original_value"],
+                    "verified_value": r["verified_value"],
+                    "verified_by": r["verified_by"],
+                    "verified_at": str(r["verified_at"]),
+                }
 
         return jsonify({
             "doc_id": doc_id,
@@ -783,6 +826,127 @@ def api_document_features(doc_id):
             "file_path": doc["file_path"] if doc else "",
             "features": features,
             "other_runs": other_runs,
+            "other_run_doc_ids": other_run_doc_ids,
+            "verifications": verifications,
+        })
+    finally:
+        conn.close()
+
+
+@app.route("/api/verify", methods=["POST"])
+def api_verify():
+    """Record a human review of one feature on one document_runs row:
+    either confirming the LLM's value or correcting it. Writes two things:
+      - document_features is updated to match the confirmed/corrected
+        value, following the same sparse convention docfeatures.py uses
+        (no row for a default value), so search/charts/browse keep working
+        unmodified and immediately reflect the reviewed value.
+      - feature_verifications gets an audit row: the LLM's original value
+        (captured once, never overwritten by re-verification), the
+        confirmed value, who, and when.
+    """
+    data = request.json or {}
+    doc_id = data.get("doc_id")
+    feature_name = (data.get("feature_name") or "").strip()
+    verified_value = data.get("verified_value")
+    client_user = (data.get("verified_by") or "").strip()
+
+    header_user = request.headers.get("X-REMOTE-USER", "").strip()
+    verified_by = header_user or client_user
+
+    if not doc_id or not feature_name or verified_value is None or verified_value == "":
+        return jsonify({"error": "doc_id, feature_name, and verified_value are required."}), 400
+    if not verified_by:
+        return jsonify({"error": "No reviewer identity available."}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT dr.file_id, r.config_yaml FROM document_runs dr "
+                "JOIN runs r ON dr.run_name = r.run_name WHERE dr.doc_id = %s",
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": f"doc_id {doc_id} not found."}), 404
+
+            cfg = yaml.safe_load(row["config_yaml"]) if row["config_yaml"] else {}
+            fdef = cfg.get("features", {}).get(feature_name)
+            ftype = fdef.get("type", "boolean") if fdef else None
+            if not fdef or ftype not in ("boolean", "enum"):
+                return jsonify({
+                    "error": f"'{feature_name}' is not a boolean/enum feature on this document's run."
+                }), 400
+
+            if ftype == "boolean":
+                vs = str(verified_value).strip().lower()
+                if vs not in ("true", "false"):
+                    return jsonify({"error": "verified_value must be true/false for a boolean feature."}), 400
+                verified_value = "True" if vs == "true" else "False"
+                is_default = verified_value == "False"
+            else:  # enum
+                options = fdef.get("options", [])
+                match = next(
+                    (o for o in options if o.lower() == str(verified_value).strip().lower()), None
+                )
+                if match is None:
+                    return jsonify({
+                        "error": f"{verified_value!r} is not one of the declared options {options}."
+                    }), 400
+                verified_value = match  # normalize to the declared casing
+                is_default = bool(options) and match == options[0]
+
+            file_id = row["file_id"]
+            cur.execute(
+                "SELECT value_text FROM document_features WHERE doc_id=%s AND feature_name=%s",
+                (doc_id, feature_name),
+            )
+            existing = cur.fetchone()
+            # Only used on the FIRST verification of this (doc_id, feature) --
+            # the ON DUPLICATE KEY UPDATE below never overwrites
+            # original_value, so it stays the LLM's true original even
+            # after later re-verifications change document_features again.
+            original_value = existing["value_text"] if existing else None
+
+        conn.autocommit(False)
+        try:
+            with conn.cursor() as cur:
+                if is_default:
+                    if existing is not None:
+                        cur.execute(
+                            "DELETE FROM document_features WHERE doc_id=%s AND feature_name=%s",
+                            (doc_id, feature_name),
+                        )
+                else:
+                    cur.execute(
+                        "INSERT INTO document_features (doc_id, file_id, feature_name, value_text) "
+                        "VALUES (%s,%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE value_text=VALUES(value_text)",
+                        (doc_id, file_id, feature_name, verified_value),
+                    )
+                cur.execute(
+                    "INSERT INTO feature_verifications "
+                    "(doc_id, feature_name, original_value, verified_value, verified_by) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "verified_value=VALUES(verified_value), "
+                    "verified_by=VALUES(verified_by), "
+                    "verified_at=CURRENT_TIMESTAMP",
+                    (doc_id, feature_name, original_value, verified_value, verified_by),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit(True)
+
+        return jsonify({
+            "doc_id": doc_id,
+            "feature_name": feature_name,
+            "verified_value": verified_value,
+            "verified_by": verified_by,
         })
     finally:
         conn.close()
