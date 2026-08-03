@@ -40,7 +40,7 @@ load_dotenv()
 # At ~3 chars/token for clinical text, 350k chars ≈ 117k tokens,
 # leaving room for the prompt (~1k tokens) and response (~500 tokens).
 # Override with --chunk-size if your model has a different context window.
-CHUNK_TARGET_CHARS = os.environ.get("CHUNK_TARGET_CHARS",350_000)
+CHUNK_TARGET_CHARS = os.environ.get("CHUNK_TARGET_CHARS",200_000)
 DEFAULT_LLM_HOST = os.environ.get("DEFAULT_LLM_HOST","http://127.0.0.1:11433")
 DEFAULT_LLM_MODEL = os.environ.get("DEFAULT_LLM_MODEL","default")
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
@@ -995,8 +995,9 @@ def process_corpus(args, config):
     conn = get_connection()
 
     config_hash = hashlib.sha256(yaml.dump(config).encode()).hexdigest()
-    get_or_create_run(conn, args.run_name, config, config_hash, host, model, temperature)
-    cleanup_incomplete(conn, args.run_name)
+    if not args.dry_run:
+        get_or_create_run(conn, args.run_name, config, config_hash, host, model, temperature)
+        cleanup_incomplete(conn, args.run_name)
 
     skip_errors = not args.retry_errors
     finished = get_finished_paths(conn, args.run_name, include_errors=skip_errors)
@@ -1033,7 +1034,7 @@ def process_corpus(args, config):
             ).rstrip()
     pending = [f for f in all_files if f not in finished]
 
-    print(f"Run          : {args.run_name}", file=sys.stderr)
+    print(f"Run          : {args.run_name}" + ("  [DRY RUN -- nothing will be saved]" if args.dry_run else ""), file=sys.stderr)
     print(f"Config       : {args.config}", file=sys.stderr)
     print(f"Source       : {source_label}", file=sys.stderr)
     if filter_config:
@@ -1084,8 +1085,11 @@ def process_corpus(args, config):
             chunks = build_chunks(text, target_chars=args.chunk_size)
             num_chunks = len(chunks)
 
-            file_id = get_or_create_file(conn, file_path, fhash, fsize)
-            doc_id = upsert_document(conn, args.run_name, file_id, num_chunks)
+            if args.dry_run:
+                file_id = None
+            else:
+                file_id = get_or_create_file(conn, file_path, fhash, fsize)
+                doc_id = upsert_document(conn, args.run_name, file_id, num_chunks)
 
             chunk_results_list = []
             for ci, chunk_text in enumerate(chunks):
@@ -1098,7 +1102,8 @@ def process_corpus(args, config):
                 prompt = build_prompt(features_config, clean_chunk, chunk_info)
                 raw = call_llm(host, model, prompt, temperature)
                 parsed = parse_json_response(raw)
-                save_chunk_result(conn, doc_id, ci, json.dumps(parsed))
+                if not args.dry_run:
+                    save_chunk_result(conn, doc_id, ci, json.dumps(parsed))
                 validate_enum_values(parsed, features_config, chunk_info)
                 chunk_results_list.append(parsed)
 
@@ -1107,10 +1112,10 @@ def process_corpus(args, config):
                 break
 
             merged = merge_chunk_results(chunk_results_list, features_config)
-            save_document_features(conn, doc_id, file_id, merged, features_config)
-
             elapsed = time.time() - doc_start
-            mark_document(conn, doc_id, "complete", elapsed=elapsed)
+            if not args.dry_run:
+                save_document_features(conn, doc_id, file_id, merged, features_config)
+                mark_document(conn, doc_id, "complete", elapsed=elapsed)
 
             processed += 1
             total_chunks += num_chunks
@@ -1153,7 +1158,7 @@ def process_corpus(args, config):
 
     print("", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
-    print(f'Run "{args.run_name}"', file=sys.stderr)
+    print(f'Run "{args.run_name}"' + ("  [DRY RUN -- nothing was saved]" if args.dry_run else ""), file=sys.stderr)
     print(f"  Processed this session : {processed}", file=sys.stderr)
     print(f"  Previously completed   : {len(finished)}", file=sys.stderr)
     print(f"  Total complete         : {total_done} / {len(all_files)}", file=sys.stderr)
@@ -1229,6 +1234,13 @@ examples:
     parser.add_argument("-r", "--run-name", help="Name for this run (used for resume).")
     parser.add_argument(
         "-n", "--limit", type=int, help="Stop after N documents."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Call the LLM and print results to the screen, but don't create "
+             "a run or write anything to the database. Useful for iterating "
+             "on feature definitions against a small corpus. Combine with "
+             "-n/--limit to bound it, or Ctrl+C to stop early.",
     )
     parser.add_argument(
         "--retry-errors",

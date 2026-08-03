@@ -721,7 +721,10 @@ def api_document_content(doc_id):
         try:
             content = raw.decode("utf-8")
         except UnicodeDecodeError:
-            content = raw.decode("cp1252")
+            try:
+                content = raw.decode("cp1252")
+            except:
+                content = raw.decode("utf-8", errors="replace")
         if len(raw) == MAX_PREVIEW_BYTES:
             content += "\n\n[... truncated ...]"
 
