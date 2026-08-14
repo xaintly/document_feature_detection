@@ -40,10 +40,15 @@ load_dotenv()
 # At ~3 chars/token for clinical text, 350k chars ≈ 117k tokens,
 # leaving room for the prompt (~1k tokens) and response (~500 tokens).
 # Override with --chunk-size if your model has a different context window.
-CHUNK_TARGET_CHARS = os.environ.get("CHUNK_TARGET_CHARS",200_000)
+CHUNK_TARGET_CHARS = os.environ.get("CHUNK_TARGET_CHARS",150_000)
 DEFAULT_LLM_HOST = os.environ.get("DEFAULT_LLM_HOST","http://127.0.0.1:11433")
 DEFAULT_LLM_MODEL = os.environ.get("DEFAULT_LLM_MODEL","default")
 TEXT_EXTENSIONS = {".txt", ".html", ".htm", ".md", ".text"}
+# Default for --chunk-retry-max-attempts: how many times to re-roll a chunk
+# when the LLM returns an enum value outside its declared options. Only
+# applies when --temperature > 0 (a temperature-0 model is deterministic, so
+# retrying would just reproduce the same invalid answer).
+CHUNK_RETRY_MAX_ATTEMPTS = 20
 
 # ---------------------------------------------------------------------------
 # Graceful Ctrl+C
@@ -653,7 +658,6 @@ def build_prompt(features_config, text, chunk_info=None):
 RETRY_DELAY_SECS = 15           # wait between retries on 503 / transient errors
 RETRY_MAX_ATTEMPTS = 12         # give up after ~3 minutes of retries
 RETRY_HTTP_CODES = {502, 503}   # codes that trigger a retry
-HALT_ON_CONN_FAILURE = False    # Connection failure = exit script vs. just wait
 
 
 class LLMServerDead(Exception):
@@ -661,11 +665,14 @@ class LLMServerDead(Exception):
     pass
 
 
-def call_llm(host, model, prompt, temperature=0.0):
+def call_llm(host, model, prompt, temperature=0.0, halt_on_conn_failure=False):
     """Send prompt to llama-server with retry on transient errors.
 
     - 502/503: server restarting → retry up to RETRY_MAX_ATTEMPTS
-    - ConnectionError: server dead → raise LLMServerDead immediately
+    - ConnectionError: retried the same as 502/503 by default, since the
+      server may just be mid-restart or there's a transient network blip.
+      Pass halt_on_conn_failure=True to instead raise LLMServerDead on the
+      first failure (--halt-on-conn-failure).
     - Other HTTP errors: raise normally (per-document error)
     """
     url = f"{host.rstrip('/')}/v1/chat/completions"
@@ -682,21 +689,21 @@ def call_llm(host, model, prompt, temperature=0.0):
 
         try:
             resp = requests.post(url, json=payload, timeout=600)
-        except (requests.ConnectionError, requests.exceptions.ConnectionError) as e:
-          if HALT_ON_CONN_FAILURE is False and attempt < RETRY_MAX_ATTEMPTS:
-              print(
-                f"  [RETRY {attempt}/{RETRY_MAX_ATTEMPTS}] "
-                f"Server returned connection error, "
-                f"waiting {RETRY_DELAY_SECS}s...",
-                file=sys.stderr,
-              )
-              time.sleep(RETRY_DELAY_SECS)
-              continue
-          else:										  
-            raise LLMServerDead(
-                f"Cannot connect to LLM server at {host} — server may be down. "
-                f"({e})"
-            ) from e
+        except requests.exceptions.ConnectionError as e:
+            if not halt_on_conn_failure and attempt < RETRY_MAX_ATTEMPTS:
+                print(
+                    f"  [RETRY {attempt}/{RETRY_MAX_ATTEMPTS}] "
+                    f"Server returned connection error, "
+                    f"waiting {RETRY_DELAY_SECS}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(RETRY_DELAY_SECS)
+                continue
+            else:
+                raise LLMServerDead(
+                    f"Cannot connect to LLM server at {host} — server may be down. "
+                    f"({e})"
+                ) from e
 
         if resp.status_code not in RETRY_HTTP_CODES:
             break
@@ -1100,11 +1107,27 @@ def process_corpus(args, config):
                     continue  # skip empty chunks (e.g., pure HTML boilerplate)
                 chunk_info = (ci + 1, num_chunks) if num_chunks > 1 else None
                 prompt = build_prompt(features_config, clean_chunk, chunk_info)
-                raw = call_llm(host, model, prompt, temperature)
-                parsed = parse_json_response(raw)
+                
+                max_attempts = args.chunk_retry_max_attempts if temperature > 0 else 1
+                for attempt in range(1, max_attempts + 1):
+                    raw = call_llm(
+                        host, model, prompt, temperature,
+                        halt_on_conn_failure=args.halt_on_conn_failure,
+                    )
+                    parsed = parse_json_response(raw)
+                    try:
+                        validate_enum_values(parsed, features_config, chunk_info)
+                    except ValueError as e:
+                        if max_attempts == 1:
+                            raise e
+                        elif attempt == max_attempts:                                            
+                            raise ValueError(f"Chunk retries limit exceeded: {e}")
+                        else:
+                            print(f"  [ERROR] {Path(file_path).name}: attempt {attempt}/{max_attempts} {e}", file=sys.stderr)
+                            continue
+                    break
                 if not args.dry_run:
-                    save_chunk_result(conn, doc_id, ci, json.dumps(parsed))
-                validate_enum_values(parsed, features_config, chunk_info)
+                    save_chunk_result(conn, doc_id, ci, json.dumps(parsed))                    
                 chunk_results_list.append(parsed)
 
             if _interrupted:
@@ -1273,6 +1296,21 @@ examples:
              "llm.temperature). Use >0 to check agreement across repeated "
              "runs of the same model.",
     )
+    parser.add_argument(
+        "--halt-on-conn-failure", action="store_true",
+        help="Treat a refused/unreachable LLM connection as fatal and halt "
+             "the run immediately. Default: retry it the same as a 502/503 "
+             "(up to ~3 minutes), since the server may just be mid-restart.",
+    )
+    parser.add_argument(
+        "--chunk-retry-max-attempts", type=int, default=CHUNK_RETRY_MAX_ATTEMPTS,
+        metavar="N",
+        help="Max attempts to re-roll a chunk when the LLM returns an enum "
+             "value outside its declared options (default: %(default)s). "
+             "Only takes effect when --temperature > 0 -- at temperature 0 "
+             "the model is deterministic, so retrying would just reproduce "
+             "the same invalid answer.",
+    )
 
     # Management commands
     parser.add_argument(
@@ -1345,6 +1383,9 @@ examples:
             parser.error(
                 "Filter section must include at least one 'require' or 'exclude' entry."
             )
+
+    if args.chunk_retry_max_attempts < 1:
+        parser.error("--chunk-retry-max-attempts must be at least 1.")
 
     # Validate feature definitions
     valid_types = ("boolean", "enum", "text", "integer")

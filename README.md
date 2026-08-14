@@ -231,8 +231,9 @@ Ctrl+C stops gracefully after the current document, prints throughput statistics
 docfeatures handles LLM server instability:
 
 - **503/502 (server restarting):** Retries up to 12 times with 15-second pauses (~3 minutes). If the server comes back, processing continues seamlessly.
-- **Connection refused (server down):** Halts the run immediately. Resume with the same `--run-name` once the server is back.  Change HALT_ON_CONN_FAILURE internally to False to treat as if 503/502.
+- **Connection refused (server down):** By default, retried the same as a 502/503 (the server may just be mid-restart or there's a transient network blip). Pass `--halt-on-conn-failure` to instead treat this as fatal and halt the run immediately — resume with the same `--run-name` once the server is back.
 - **Thermal throttling (compact hardware):** Use `--cooldown 3` to inject pauses between documents, reducing sustained heat load on devices like the NVIDIA DGX Spark.
+- **Invalid enum values (temperature > 0 only):** If the LLM returns an enum value outside its declared `options`, the chunk is re-rolled up to `--chunk-retry-max-attempts` times (default 20). Only applies when sampling temperature is above 0 — a temperature-0 model is deterministic, so retrying would just reproduce the same invalid answer.
 
 ## Database
 
