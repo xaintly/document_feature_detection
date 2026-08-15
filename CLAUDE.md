@@ -197,6 +197,17 @@ call. Lifecycle: `prepare` (offline, no AWS calls) → `submit` → `status` (po
   `(doc_id, chunk_index)`. A document that sanitizes to zero non-empty chunks (pure boilerplate) is
   completed immediately in `prepare` itself with default feature values, the same outcome the sync path
   produces for such documents, and never enters the batch.
+- `-n`/`--limit` bounds the *document* count, but `--batch-max-records` bounds the *record* (chunk) count
+  for the whole job — they're not the same axis, and a `-n` that looks safely under the quota can still
+  produce a job over it if documents chunk into more than one record each. `prepare` tracks
+  `writer.total_records` as a running total and checks `writer.total_records + total_chunks >
+  args.batch_max_records` *before* staging each document (i.e. before `upsert_document`), breaking out of
+  the `pending` loop rather than staging past the limit and letting `submit`/Bedrock validation fail on
+  it later. `stopped_at_limit` drives a summary line reporting documents-staged-of-requested; the
+  unstaged remainder is untouched (not `batch_pending`, not errored) so a follow-up `prepare` (same
+  `-r`, new `--job-name`) picks them back up normally. A single document whose own chunk count exceeds
+  `--batch-max-records` raises inside the per-file `try` (caught by the existing error handler below) —
+  it can never fit regardless of what else is in the job.
 - Because `get_finished_paths()` (shared lib) treats `batch_pending` as claimed, the sync tool and a
   second `prepare` (same or different run) won't re-stage a file that's already inside an unresolved
   batch job — this is what prevents double-processing across the two tools or concurrent batches.

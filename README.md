@@ -306,10 +306,19 @@ treat as claimed, so nothing gets double-processed across the two tools or concu
 run. `cancel` is the release valve: it deletes those `batch_pending` rows (returning the files to the
 pending pool for the run) whether the job was ever submitted, is still running, or failed on AWS.
 
-`prepare` splits staged records across multiple `.jsonl` files according to `--batch-max-records` and
-`--batch-max-file-bytes`, and warns (without blocking) if the total is under `--batch-min-records`. The
-defaults (100 min / 100,000 max records per job, ~1GB max per file) match this project's confirmed AWS
-Service Quotas — override them via flags if your account's quotas differ.
+`--batch-max-records` caps the **whole job's total record count** — every chunk across every staged
+document counts as one record, not one per document, so a `-n`/`--limit` document count doesn't
+translate 1:1 into records. `prepare` tracks the running total as it stages and stops *before* it would
+push the job over the limit, rather than staging everything `-n` asked for and letting the job fail
+validation at submit time. If it stops early, the summary says how many documents were actually staged
+out of how many were requested — the rest are left pending (not touched, not errored) for a follow-up
+`prepare` (same `-r`, a new `--job-name`) to pick up into another job. A single document whose own chunk
+count exceeds `--batch-max-records` can never fit in any job at that limit and is marked `'error'`
+immediately with a message saying so, rather than silently produced anyway or hung on forever.
+`--batch-max-file-bytes` is a separate, per-*file* concern (multiple `.jsonl` files can make up one job)
+and warns (without blocking) if the total is under `--batch-min-records`. The defaults (100 min / 100,000
+max records per job, ~1GB max per file) match this project's confirmed AWS Service Quotas — override them
+via flags if your account's quotas differ.
 
 ### Testing model access (`query_bedrock.py`)
 

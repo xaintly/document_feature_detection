@@ -365,6 +365,7 @@ def cmd_prepare(args):
     staged = 0
     auto_completed = 0
     errors = 0
+    stopped_at_limit = False
 
     for file_path in pending:
         doc_id = None
@@ -397,6 +398,23 @@ def cmd_prepare(args):
                 continue
 
             total_chunks = len(clean_chunks)
+
+            # --batch-max-records caps the whole JOB's record count (every
+            # chunk across every staged document is one record), not the
+            # per-document count -- a document with many chunks can eat a
+            # disproportionate share of it. Check the running total *before*
+            # staging, so a job never ends up over the limit regardless of
+            # how -n/--limit was set.
+            if total_chunks > args.batch_max_records:
+                raise ValueError(
+                    f"This document alone chunks into {total_chunks} record(s), which exceeds "
+                    f"--batch-max-records ({args.batch_max_records}) -- it can never fit in a "
+                    f"single batch job at this limit. Increase --batch-max-records or --chunk-size."
+                )
+            if writer.total_records + total_chunks > args.batch_max_records:
+                stopped_at_limit = True
+                break
+
             doc_id = upsert_document(
                 conn, args.run_name, file_id, total_chunks,
                 status="batch_pending", batch_job_id=batch_job_id,
@@ -432,6 +450,17 @@ def cmd_prepare(args):
         print(f"Errors (skipped, marked 'error'): {errors}", file=sys.stderr)
     for p in writer.written_paths:
         print(f"  {p}", file=sys.stderr)
+
+    if stopped_at_limit:
+        processed = staged + auto_completed + errors
+        remaining = len(pending) - processed
+        print(
+            f"\nStopped early at --batch-max-records ({args.batch_max_records}): staging one "
+            f"more document's chunks would have pushed this job over the limit. Prepared "
+            f"{staged} of {len(pending)} requested document(s); {remaining} remain pending "
+            f"-- run `prepare` again (same -r, a new --job-name) to stage them into another job.",
+            file=sys.stderr,
+        )
 
     if writer.total_records == 0:
         print("\nNothing to submit -- no records were staged.", file=sys.stderr)
