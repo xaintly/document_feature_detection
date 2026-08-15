@@ -249,7 +249,7 @@ docfeatures handles LLM server instability:
 - **503/502 (server restarting):** Retries up to 12 times with 15-second pauses (~3 minutes). If the server comes back, processing continues seamlessly.
 - **Connection refused (server down):** By default, retried the same as a 502/503 (the server may just be mid-restart or there's a transient network blip). Pass `--halt-on-conn-failure` to instead treat this as fatal and halt the run immediately — resume with the same `--run-name` once the server is back.
 - **Thermal throttling (compact hardware):** Use `--cooldown 3` to inject pauses between documents, reducing sustained heat load on devices like the NVIDIA DGX Spark.
-- **Invalid enum values (temperature > 0 only):** If the LLM returns an enum value outside its declared `options`, the chunk is re-rolled up to `--chunk-retry-max-attempts` times (default 20). Only applies when sampling temperature is above 0 — a temperature-0 model is deterministic, so retrying would just reproduce the same invalid answer.
+- **Malformed JSON or an invalid enum value:** the chunk is retried up to `--chunk-retry-max-attempts` times (default 3) — but not by resending an identical prompt and hoping for a different roll. Each retry tells the model what it answered and specifically why that was rejected, and asks for a correction. Because the retry prompt is different from the original (not just resampled), this works the same regardless of `--temperature`, including the default of 0. Set `--chunk-retry-max-attempts 1` to disable retrying entirely — useful if you're studying the model's raw first-attempt failure rate rather than triaging around it.
 
 ## Batch Processing (AWS Bedrock)
 

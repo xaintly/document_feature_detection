@@ -98,9 +98,12 @@ fits (HTML headers → markdown headers → paragraph breaks → sentences → l
 control chars, normalizes whitespace) *after* chunking so structural markup survives the split →
 `build_prompt()` turns the YAML `features` block into instructions → `call_llm()` posts to
 `{host}/v1/chat/completions` → `parse_json_response()` tolerates markdown fences, chain-of-thought
-preamble, and truncated/unclosed JSON (brace-repair) → `validate_enum_values()` re-rolls a chunk (up to
-`CHUNK_RETRY_MAX_ATTEMPTS`, only when `temperature > 0`) if the model returns an enum value outside its
-declared `options` → all chunk results for a document are combined by `merge_chunk_results()`.
+preamble, and truncated/unclosed JSON (brace-repair) → on a parse failure or `validate_enum_values()`
+rejecting an out-of-options value, the chunk is retried (up to `CHUNK_RETRY_MAX_ATTEMPTS`, default 3) with
+`build_correction_note()` appended to the prompt via `build_prompt(..., correction=...)`, describing the
+previous bad response and why it was rejected — a corrective retry, not a blind reroll, so it applies
+regardless of `--temperature` (see "LLM server resilience" below for why that distinction matters) → all
+chunk results for a document are combined by `merge_chunk_results()`.
 
 Merge semantics per feature type (chunks → one document-level value):
 - `boolean`: OR (any chunk true → true)
@@ -172,10 +175,24 @@ that every referenced feature name is defined in *that run's stored config_yaml*
 
 502/503 responses retry up to `RETRY_MAX_ATTEMPTS` (12) with `RETRY_DELAY_SECS` (15s) pauses — these two
 are hardcoded, not CLI flags. A refused/unreachable connection is retried the same way by default; pass
-`--halt-on-conn-failure` to instead raise `LLMServerDead` and halt the run on the first failure. Chunk
-retries for out-of-options enum values (`--chunk-retry-max-attempts`, default 20) only kick in when
-`--temperature > 0` — deterministic temperature-0 output won't change on retry, so `max_attempts` is
-forced to 1 regardless of the flag in that case.
+`--halt-on-conn-failure` to instead raise `LLMServerDead` and halt the run on the first failure.
+
+`--chunk-retry-max-attempts` (default 3, was 20) used to only apply when `--temperature > 0`, on the
+reasoning that a temperature-0 model is deterministic so resending an identical prompt would just
+reproduce the same invalid answer. That reasoning was correct but the conclusion was too narrow: it
+conflated "retry" with "blind reroll." As of `build_correction_note()`, a retry sends a *different*
+prompt — the original plus what the model answered last time and specifically why it was rejected (a
+parse failure or `validate_enum_values()` rejecting an out-of-options value) — so it's a meaningful retry
+regardless of temperature, not just when sampling might get lucky on a second roll. The
+`if temperature > 0 else 1` gate on `max_attempts` is gone; `--chunk-retry-max-attempts` alone controls
+it now, and `1` still means "no retry" (useful for studying a model's raw first-attempt failure rate
+rather than triaging around it — a real use case, hence keeping the escape hatch rather than forcing
+retries unconditionally). The default dropped from 20 to 3 because a corrective retry that tells the
+model exactly what was wrong should converge fast if it's going to converge at all — pushing to 20
+blind-reroll-style attempts stopped making sense once each attempt got smarter. Deliberately *not* a
+multi-turn conversation (no fake assistant turn appended to `messages`) — the correction is folded into
+one user-turn prompt string via `build_prompt(..., correction=...)`, so `call_llm()`'s single-message
+payload shape didn't need to change.
 
 `call_llm(..., api_key=None)` sends `Authorization: Bearer <api_key>` when set — for commercial
 OpenAI-compatible endpoints (OpenAI itself, or any other hosted provider using the same shape), not just

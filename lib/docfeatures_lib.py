@@ -602,8 +602,15 @@ def build_chunks(text, target_chars=CHUNK_TARGET_CHARS):
 # Prompt Generation
 # ===========================================================================
 
-def build_prompt(features_config, text, chunk_info=None):
-    """Assemble the extraction prompt from feature definitions + document."""
+def build_prompt(features_config, text, chunk_info=None, correction=None):
+    """Assemble the extraction prompt from feature definitions + document.
+
+    correction, if given (see build_correction_note()), is appended just
+    before the final "JSON output:" cue -- describes a previous invalid
+    attempt so a retry can ask the model to fix that specific problem
+    instead of resending an identical prompt and hoping sampling gives a
+    different answer.
+    """
     parts = [
         "You are a clinical document analyst. Given the document text below, "
         "extract the requested features.",
@@ -648,8 +655,31 @@ def build_prompt(features_config, text, chunk_info=None):
             parts.append(f"  {desc}")
         parts.append("")
 
-    parts += ["Document text:", "---", text, "---", "", "JSON output:"]
+    parts += ["Document text:", "---", text, "---", ""]
+    if correction:
+        parts.append(correction)
+        parts.append("")
+    parts.append("JSON output:")
     return "\n".join(parts)
+
+
+def build_correction_note(previous_response_text, error_message):
+    """Build the build_prompt(correction=...) addendum for a retry: what the
+    model answered last time, and specifically why it was rejected. Works
+    regardless of temperature -- unlike a blind reroll (which only has a
+    chance of a different answer when sampling is stochastic), this changes
+    the input itself, so it's a meaningful retry even at temperature 0.
+
+    previous_response_text is a plain string, not a dict -- callers pass
+    json.dumps(parsed) for a parsed-but-invalid response, or a raw text
+    excerpt if the previous attempt didn't produce parseable JSON at all
+    (parse_json_response failures are retryable through the same path).
+    """
+    return (
+        f"Your previous response was: {previous_response_text}\n"
+        f"This was invalid: {error_message}\n"
+        f"Provide a corrected JSON response following the instructions above."
+    )
 
 
 # ===========================================================================

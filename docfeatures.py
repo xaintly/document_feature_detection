@@ -31,6 +31,7 @@ import yaml
 from lib.docfeatures_lib import (
     CHUNK_TARGET_CHARS,
     build_chunks,
+    build_correction_note,
     build_prompt,
     cleanup_incomplete,
     discover_files,
@@ -68,11 +69,15 @@ DEFAULT_LLM_MODEL = os.environ.get("DEFAULT_LLM_MODEL", "default")
 # displayed back (e.g. via docfeatures_web.py), so routing a secret through
 # it would mean storing it in the database. --api-key / API_KEY only.
 DEFAULT_API_KEY = os.environ.get("API_KEY")
-# Default for --chunk-retry-max-attempts: how many times to re-roll a chunk
-# when the LLM returns an enum value outside its declared options. Only
-# applies when --temperature > 0 (a temperature-0 model is deterministic, so
-# retrying would just reproduce the same invalid answer).
-CHUNK_RETRY_MAX_ATTEMPTS = 20
+# Default for --chunk-retry-max-attempts: how many times to retry a chunk
+# when the LLM returns an enum value outside its declared options, before
+# giving up on the document. Applies regardless of temperature -- each retry
+# tells the model what it answered and why that was rejected (see
+# build_correction_note), so it's a meaningful retry even at temperature 0,
+# not a blind reroll hoping sampling gives a different answer. Set to 1 to
+# disable retrying (e.g. to study the model's raw first-attempt failure
+# rate rather than triage around it).
+CHUNK_RETRY_MAX_ATTEMPTS = 3
 
 # ---------------------------------------------------------------------------
 # Graceful Ctrl+C
@@ -311,17 +316,19 @@ def process_corpus(args, config):
                 if not clean_chunk:
                     continue  # skip empty chunks (e.g., pure HTML boilerplate)
                 chunk_info = (ci + 1, num_chunks) if num_chunks > 1 else None
-                prompt = build_prompt(features_config, clean_chunk, chunk_info)
 
-                max_attempts = args.chunk_retry_max_attempts if temperature > 0 else 1
+                max_attempts = args.chunk_retry_max_attempts
+                correction = None
                 for attempt in range(1, max_attempts + 1):
+                    prompt = build_prompt(features_config, clean_chunk, chunk_info, correction=correction)
                     raw = call_llm(
                         host, model, prompt, temperature,
                         halt_on_conn_failure=args.halt_on_conn_failure,
                         api_key=api_key,
                     )
-                    parsed = parse_json_response(raw)
+                    parsed = None  # reset each attempt -- must not leak a stale value into the fallback below
                     try:
+                        parsed = parse_json_response(raw)
                         validate_enum_values(parsed, features_config, chunk_info)
                     except ValueError as e:
                         if max_attempts == 1:
@@ -330,6 +337,13 @@ def process_corpus(args, config):
                             raise ValueError(f"Chunk retries limit exceeded: {e}")
                         else:
                             print(f"  [ERROR] {Path(file_path).name}: attempt {attempt}/{max_attempts} {e}", file=sys.stderr)
+                            # Retry with the actual error fed back, not a blind
+                            # reroll -- this changes the input, so it's a
+                            # meaningful retry even at temperature 0. Fall back
+                            # to a raw-text excerpt if parsing itself failed
+                            # (nothing to json.dumps in that case).
+                            prev_text = json.dumps(parsed) if parsed is not None else (raw[:500] if raw else "(empty response)")
+                            correction = build_correction_note(prev_text, str(e))
                             continue
                     break
                 if not args.dry_run:
@@ -518,11 +532,12 @@ examples:
     parser.add_argument(
         "--chunk-retry-max-attempts", type=int, default=CHUNK_RETRY_MAX_ATTEMPTS,
         metavar="N",
-        help="Max attempts to re-roll a chunk when the LLM returns an enum "
-             "value outside its declared options (default: %(default)s). "
-             "Only takes effect when --temperature > 0 -- at temperature 0 "
-             "the model is deterministic, so retrying would just reproduce "
-             "the same invalid answer.",
+        help="Max attempts for a chunk that fails to parse as JSON or returns an "
+             "enum value outside its declared options (default: %(default)s). "
+             "Each retry tells the model what it answered and why that was "
+             "rejected, so this applies regardless of --temperature -- it's not "
+             "a blind reroll. Set to 1 to disable retrying entirely (e.g. to "
+             "study the model's raw first-attempt failure rate).",
     )
 
     # Management commands
