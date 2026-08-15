@@ -42,9 +42,11 @@ python docfeatures.py --purge-run v1
 python query_bedrock.py -m <model-id> -p "hello"          # sanity-check model ID/access before a real batch job
 python query_bedrock.py -m <model-id> --check-access       # free control-plane check, no invoke
 python docfeatures_batch.py prepare -c features.yaml --corpus /data/notes/ -r v1 -n 100  # stage .jsonl, no AWS calls
-python docfeatures_batch.py submit --job-name v1-x --model-id <bedrock-model-id> --s3-bucket <bucket> --role-arn <arn>
+python docfeatures_batch.py submit --job-name v1-x   # --model-id/--s3-bucket/--role-arn from .env if set, else pass them here
 python docfeatures_batch.py status --job-name v1-x
-python docfeatures_batch.py import --job-name v1-x     # once Completed/PartiallyCompleted
+python docfeatures_batch.py import --job-name v1-x --dry-run   # preview, writes nothing to the DB
+python docfeatures_batch.py import --job-name v1-x -vv          # once Completed/PartiallyCompleted, for real
+python docfeatures_batch.py cleanup --job-name v1-x    # delete local .jsonl + S3 input/output once you're done with it
 python docfeatures_batch.py cancel --job-name v1-x      # returns its documents to the pending pool
 python docfeatures_batch.py list-jobs -r v1
 
@@ -213,6 +215,10 @@ call. Lifecycle: `prepare` (offline, no AWS calls) → `submit` → `status` (po
   nothing about the staged records is model-specific. `--model-id` sometimes needs to be a cross-region
   inference profile ID (`us.anthropic...`), not the bare foundation-model ID some Claude models reject for
   on-demand use — validate with `query_bedrock.py` first rather than discovering this at submit time.
+  `--model-id`/`--s3-bucket`/`--role-arn` each fall back to `BEDROCK_MODEL_ID`/`BEDROCK_S3_BUCKET`/
+  `BEDROCK_ROLE_ARN` from `.env` (`DEFAULT_BEDROCK_*` module constants) when omitted — not `required=True`
+  in argparse anymore, so the "at least one of CLI/env must supply it" check happens as an explicit
+  post-parse validation in `main()` instead, naming exactly which ones are missing.
 - **`status`** calls `get_model_invocation_job` and writes Bedrock's own status string (`Submitted`,
   `Validating`, `Scheduled`, `InProgress`, `Completed`, `PartiallyCompleted`, `Failed`, `Expired`,
   `Stopping`, `Stopped`) straight into `batch_jobs.status` — no local remapping.
@@ -224,16 +230,43 @@ call. Lifecycle: `prepare` (offline, no AWS calls) → `submit` → `status` (po
   A document missing any chunk (errored record, or a `PartiallyCompleted` job that never got to it) is
   marked `'error'` instead; there's no post-hoc retry. Idempotency guard is `batch_jobs.imported_at`
   (not `status`, which stays Bedrock's own value so `status` can still be re-checked after import) —
-  `import --force` re-runs it. `import --verbose` (`-v`) prints each successfully-completed document's
-  merged feature values as they're written, in the same `fmt_feature_value`-formatted style as
-  `docfeatures.py`'s own progress line (`fmt_feature_value` lives in `lib/docfeatures_lib.py` now,
-  shared by both) — only on success; errored documents still aren't printed per-document, only counted.
+  `import --force` re-runs it. `-v`/`--verbose` is a count (`action="count"`), not a boolean:
+  `verbosity = max(args.verbose, 2 if args.dry_run else 0)` — level 1 (`-v`) prints each successfully-
+  completed document's merged feature values as they're written (`fmt_feature_value`-formatted, same
+  style as `docfeatures.py`'s own progress line; `fmt_feature_value` lives in `lib/docfeatures_lib.py`,
+  shared by both); level 2 (`-vv`) additionally prints per-record parse/validation errors as they're
+  found rather than only counting them. `--dry-run` forces verbosity to at least 2 and skips every DB
+  write (`save_chunk_result`, `save_document_features`, `mark_document`, and
+  `update_batch_job(imported_at=...)` all become no-ops via `if not args.dry_run:` guards) — it also
+  bypasses the `imported_at`-without-`--force` guard, since a dry run changes nothing and is safe to
+  repeat freely, including against a job that's already been really imported (though `pending_docs` will
+  be empty by then, since those rows are no longer `'batch_pending'`). This is the "view a completed run"
+  feature: run it before a real `import` to inspect results, or after a failure to tell a total loss from
+  a partial success before deciding whether to `cancel`-and-retry.
+- Every DB write in `import` (`save_chunk_result`, and `save_document_features`+`mark_document` together)
+  is wrapped in `try/except pymysql.err.IntegrityError`, counted separately as `integrity_errors` and
+  reported in the summary, rather than letting one bad row crash the whole import. Root cause: both
+  `chunk_results` and `document_features` FK to `document_runs(doc_id)`, and a `doc_id` embedded in a
+  batch job's S3 output can go stale if a *later* `prepare` for the same run re-stages the same file
+  (`upsert_document` deletes-then-reinserts, handing it a new `doc_id`) before this job's `import` gets
+  around to it — the old `doc_id` this job's output still references no longer exists in `document_runs`
+  at all. `save_chunk_result`'s failure can't report a file name (the doc_id→file_id lookup goes through
+  the now-gone `document_runs` row); `save_document_features`'s can, since `pending_docs` already joined
+  `files` before the race window. Avoid triggering this by not re-running `prepare` for a run while an
+  older batch job for that same run is still unimported.
 - **`cancel`** calls `stop_model_invocation_job` if the job is still AWS-active, then unconditionally
   `DELETE`s the `document_runs` rows tied to that `batch_job_id` (FK cascade cleans up any partial
   `chunk_results`), returning those files to the pending pool, and sets `batch_jobs.status='cancelled'`
   (a local-only terminal state, distinct from Bedrock's own `Stopped`). This is the same path whether the
   job was never submitted, is still running, or failed on AWS — the "return files to the pool" ask this
   feature was built around.
+- **`cleanup`** deletes the local staged `.jsonl` directory (`work_dir/run_name/job_name/`) and/or the
+  job's S3 input/output prefixes (`--keep-local`/`--keep-s3-input`/`--keep-s3-output` opt out of each
+  individually; default is delete all three). Refuses if `status in ACTIVE_STATUSES` — the same active-set
+  `cancel` uses to decide whether to call `stop_model_invocation_job` — so it can't be used to yank the
+  input/output out from under a job Bedrock is still processing. Doesn't touch the `batch_jobs`/
+  `document_runs` rows at all, only files; the DB record stays as a historical record after cleanup.
+  `delete_s3_keys()` batches `delete_objects` calls at 1000 keys (the API's per-call limit).
 - `prepare --disable-thinking` sets `thinking: {type: disabled}`. **Opt-in, off by default** — this
   briefly defaulted to *on* (batch is one-shot per chunk with no retry, and `merge_chunk_results` discards
   reasoning tokens anyway, so disabling looked like a pure win), but real usage found Bedrock Batch's

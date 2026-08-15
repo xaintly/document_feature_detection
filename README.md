@@ -253,6 +253,10 @@ pip install -r requirements-batch.txt
 
 ### Workflow
 
+`--model-id`/`--s3-bucket`/`--role-arn` for `submit` can be set once via `.env` (`BEDROCK_MODEL_ID`,
+`BEDROCK_S3_BUCKET`, `BEDROCK_ROLE_ARN` — see `env.example`) instead of repeating them on every
+invocation; CLI flags still override them when passed.
+
 ```bash
 # 0. Sanity-check the model ID and your access to it with a single cheap call
 #    (see "Testing model access" below) before committing to a min-100-record batch job
@@ -262,6 +266,8 @@ python query_bedrock.py -m us.anthropic.claude-haiku-4-5-20251001-v1:0 -p "hello
 python docfeatures_batch.py prepare -c features.yaml --corpus /data/notes/ -r v1 -n 100
 
 # 2. Upload to S3 and create the Bedrock batch inference job
+python docfeatures_batch.py submit --job-name v1-20260814
+# (or, with everything explicit instead of relying on .env defaults:)
 python docfeatures_batch.py submit --job-name v1-20260814 \
     --model-id us.anthropic.claude-haiku-4-5-20251001-v1:0 \
     --s3-bucket my-batch-bucket --role-arn arn:aws:iam::123456789012:role/BedrockBatchRole
@@ -269,9 +275,16 @@ python docfeatures_batch.py submit --job-name v1-20260814 \
 # 3. Poll status (updates the local DB's record of the job too)
 python docfeatures_batch.py status --job-name v1-20260814
 
-# 4. Once Completed/PartiallyCompleted, pull results into MySQL
+# 4. Once Completed/PartiallyCompleted, preview results without touching the database...
+python docfeatures_batch.py import --job-name v1-20260814 --dry-run
+# ...then pull them in for real
 python docfeatures_batch.py import --job-name v1-20260814
-python docfeatures_batch.py import --job-name v1-20260814 --verbose   # also print each document's feature values as they're written
+python docfeatures_batch.py import --job-name v1-20260814 -v    # also print each document's feature values as they're written
+python docfeatures_batch.py import --job-name v1-20260814 -vv   # also print per-record parse/validation errors as they're found
+
+# 5. Once you're done with a job, delete its local .jsonl staging and S3 input/output objects
+python docfeatures_batch.py cleanup --job-name v1-20260814 --dry-run   # preview first
+python docfeatures_batch.py cleanup --job-name v1-20260814
 
 # List locally-known jobs (no AWS call)
 python docfeatures_batch.py list-jobs -r v1
@@ -280,6 +293,12 @@ python docfeatures_batch.py list-jobs -r v1
 # for a job you decide not to run, or one that failed
 python docfeatures_batch.py cancel --job-name v1-20260814
 ```
+
+`cleanup` refuses to touch a job that's still active on AWS (`Submitted`/`Validating`/`Scheduled`/
+`InProgress` — run `status` first if unsure, or `cancel` it instead). By default it deletes all three of
+the local staged `.jsonl` directory, the S3 input objects, and the S3 output objects; opt out of any of
+those individually with `--keep-local`, `--keep-s3-input`, `--keep-s3-output`. It only touches files —
+the `batch_jobs`/`document_runs` database rows are left alone as a historical record.
 
 Each `prepare` command creates a `batch_jobs` row (status `preparing`) and moves the documents it stages
 into `document_runs.status = 'batch_pending'` — a state the sync tool and other batch `prepare` runs both
@@ -369,10 +388,18 @@ config only shows up as a per-record `error` in the job's output, or (as above) 
 ### Cleaning up and retrying
 
 A job that fails outright (e.g. IAM permissions) or completes with every record errored (e.g. a rejected
-`additionalModelRequestFields` field) leaves its documents claimed and going nowhere on their own. Don't
-run `import` on a job with no usable output — `import` marks every document `'error'`, and unlike
-`cancel`, that status is **not** automatically re-picked-up by a plain `prepare` (see `--retry-errors`
-below). For a fully-failed job, go straight to:
+`additionalModelRequestFields` field) leaves its documents claimed and going nowhere on their own.
+`import --dry-run` is the safe way to check first — it shows exactly what a real `import` would do
+(including per-record errors at the detail `--dry-run` always shows) without writing anything to the
+database, so you can tell a total loss from a partial success before committing to anything:
+
+```bash
+python docfeatures_batch.py import --job-name v1-20260814 --dry-run
+```
+
+If it shows no usable output, don't run a real `import` — `import` marks every document `'error'`, and
+unlike `cancel`, that status is **not** automatically re-picked-up by a plain `prepare` (see
+`--retry-errors` below). For a fully-failed job, go straight to:
 
 ```bash
 python docfeatures_batch.py cancel --job-name <job-name>   # returns its documents to the pending pool

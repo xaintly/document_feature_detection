@@ -32,8 +32,12 @@ Usage:
     # 3. Poll status
     python docfeatures_batch.py status --job-name v1-20260814
 
-    # 4. Once Completed/PartiallyCompleted, pull results into MySQL
+    # 4. Preview results without writing to the DB, or pull them in for real
+    python docfeatures_batch.py import --job-name v1-20260814 --dry-run
     python docfeatures_batch.py import --job-name v1-20260814
+
+    # 5. Delete the local .jsonl staging and S3 input/output for a finished job
+    python docfeatures_batch.py cleanup --job-name v1-20260814
 
     # Return files to the pending pool if you cancel or a job fails
     python docfeatures_batch.py cancel --job-name v1-20260814
@@ -46,10 +50,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
 
+import pymysql
 import yaml
 
 try:
@@ -102,6 +108,12 @@ DEFAULT_BATCH_MIN_RECORDS = 100
 DEFAULT_BATCH_MAX_RECORDS = 100_000
 DEFAULT_BATCH_MAX_FILE_BYTES = 950_000_000  # AWS max is 1GB; leave margin
 DEFAULT_WORK_DIR = "./batch_work"
+
+# submit's --model-id/--s3-bucket/--role-arn fall back to these if set, so
+# they don't need to be repeated on every invocation.
+DEFAULT_BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
+DEFAULT_BEDROCK_S3_BUCKET = os.environ.get("BEDROCK_S3_BUCKET")
+DEFAULT_BEDROCK_ROLE_ARN = os.environ.get("BEDROCK_ROLE_ARN")
 
 # Bedrock's own job status values (from GetModelInvocationJob) that mean
 # the job is still active on AWS and eligible for StopModelInvocationJob.
@@ -260,6 +272,13 @@ def list_s3_objects(s3, bucket, prefix):
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             yield obj["Key"]
+
+
+def delete_s3_keys(s3, bucket, keys):
+    """Batch-delete via DeleteObjects (max 1000 keys per call)."""
+    for i in range(0, len(keys), 1000):
+        batch = keys[i : i + 1000]
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
 
 
 # ===========================================================================
@@ -562,14 +581,21 @@ def cmd_import(args):
     if not job:
         print(f"No batch job named '{args.job_name}'.", file=sys.stderr)
         sys.exit(1)
-    if job["imported_at"] and not args.force:
+    if job["imported_at"] and not args.force and not args.dry_run:
         print(f"Job '{args.job_name}' was already imported at {job['imported_at']}. "
-              f"Use --force to re-import.", file=sys.stderr)
+              f"Use --force to re-import, or --dry-run to view without re-importing.", file=sys.stderr)
         sys.exit(1)
     if job["status"] not in IMPORTABLE_STATUSES:
         print(f"Job '{args.job_name}' is in status '{job['status']}', not "
               f"Completed/PartiallyCompleted. Run `status` first.", file=sys.stderr)
         sys.exit(1)
+
+    # --dry-run never writes to the DB and always shows at least as much
+    # detail as -vv (successes AND per-record errors as they're found, not
+    # just counted in the summary) -- it exists specifically to let you
+    # inspect a job's results before committing to a real import.
+    verbosity = max(args.verbose, 2 if args.dry_run else 0)
+    tag = "[DRY RUN] " if args.dry_run else ""
 
     config = get_run_config(conn, job["run_name"])
     features_config = config["features"]
@@ -580,6 +606,7 @@ def cmd_import(args):
     chunk_data = {}   # doc_id -> {chunk_index: parsed_json}
     doc_errors = {}   # doc_id -> [error strings]
     records_seen = 0
+    integrity_errors = 0   # writes rejected by a FK constraint -- see save_chunk_result below
 
     for key in list_s3_objects(s3, bucket, prefix):
         if key.endswith("manifest.json.out"):
@@ -605,9 +632,10 @@ def cmd_import(args):
             records_seen += 1
 
             if "error" in obj:
-                doc_errors.setdefault(doc_id, []).append(
-                    f"chunk {chunk_index}: {obj['error'].get('errorMessage', obj['error'])}"
-                )
+                err = f"chunk {chunk_index}: {obj['error'].get('errorMessage', obj['error'])}"
+                doc_errors.setdefault(doc_id, []).append(err)
+                if verbosity >= 2:
+                    print(f"  {tag}[ERROR] doc_id={doc_id} {err}", file=sys.stderr)
                 continue
 
             try:
@@ -615,10 +643,28 @@ def cmd_import(args):
                 parsed = parse_json_response(raw_text)
                 validate_enum_values(parsed, features_config)
             except (KeyError, ValueError) as e:
-                doc_errors.setdefault(doc_id, []).append(f"chunk {chunk_index}: {e}")
+                err = f"chunk {chunk_index}: {e}"
+                doc_errors.setdefault(doc_id, []).append(err)
+                if verbosity >= 2:
+                    print(f"  {tag}[ERROR] doc_id={doc_id} {err}", file=sys.stderr)
                 continue
 
-            save_chunk_result(conn, doc_id, chunk_index, json.dumps(parsed))
+            if not args.dry_run:
+                try:
+                    save_chunk_result(conn, doc_id, chunk_index, json.dumps(parsed))
+                except pymysql.err.IntegrityError as e:
+                    # FK violation: no document_runs row exists for this doc_id anymore.
+                    # Can happen if the same file got re-staged (new doc_id) by a later
+                    # `prepare` for this run before this job's import got around to it --
+                    # the old doc_id's document_runs row was deleted out from under this
+                    # job. We can't recover a file name here (that lookup goes through the
+                    # now-gone document_runs row); report what we have and move on instead
+                    # of taking down the rest of the import.
+                    integrity_errors += 1
+                    print(f"  [ERROR] doc_id={doc_id} chunk={chunk_index}: could not save chunk "
+                          f"result -- no document_runs row for this doc_id (likely re-staged by "
+                          f"a later run before this import completed): {e}", file=sys.stderr)
+                    continue
             chunk_data.setdefault(doc_id, {})[chunk_index] = parsed
 
     with conn.cursor() as cur:
@@ -635,28 +681,48 @@ def cmd_import(args):
     for row in pending_docs:
         doc_id, file_id, total_chunks = row["doc_id"], row["file_id"], row["total_chunks"]
         if doc_id in doc_errors:
-            mark_document(conn, doc_id, "error", error="; ".join(doc_errors[doc_id][:5]))
+            if not args.dry_run:
+                mark_document(conn, doc_id, "error", error="; ".join(doc_errors[doc_id][:5]))
             errored += 1
             continue
         got = chunk_data.get(doc_id, {})
         if len(got) == total_chunks:
             ordered = [got[i] for i in range(total_chunks)]
             merged = merge_chunk_results(ordered, features_config)
-            save_document_features(conn, doc_id, file_id, merged, features_config)
-            mark_document(conn, doc_id, "complete")
+            if not args.dry_run:
+                try:
+                    save_document_features(conn, doc_id, file_id, merged, features_config)
+                    mark_document(conn, doc_id, "complete")
+                except pymysql.err.IntegrityError as e:
+                    # Same race as save_chunk_result above, just later: this doc_id's
+                    # document_runs row existed when `pending_docs` was fetched but was
+                    # deleted (re-staged by a concurrent prepare/run) before we got here.
+                    integrity_errors += 1
+                    print(f"  [ERROR] doc_id={doc_id} ({Path(row['file_path']).name}): could not "
+                          f"save document features -- document_runs row no longer exists: {e}",
+                          file=sys.stderr)
+                    continue
             completed += 1
-            if args.verbose:
+            if verbosity >= 1:
                 feat_str = "  ".join(f"{k}={fmt_feature_value(v)}" for k, v in merged.items())
-                print(f"  [{completed + errored}/{len(pending_docs)}] {Path(row['file_path']).name}  "
+                print(f"  {tag}[{completed + errored}/{len(pending_docs)}] {Path(row['file_path']).name}  "
                       f"({total_chunks} chunk{'s' if total_chunks != 1 else ''})  {feat_str}")
         else:
-            mark_document(conn, doc_id, "error", error=f"only {len(got)}/{total_chunks} chunks returned by Bedrock")
+            err = f"only {len(got)}/{total_chunks} chunks returned by Bedrock"
+            if not args.dry_run:
+                mark_document(conn, doc_id, "error", error=err)
             errored += 1
+            if verbosity >= 2:
+                print(f"  {tag}[ERROR] doc_id={doc_id} ({Path(row['file_path']).name}) {err}", file=sys.stderr)
 
-    update_batch_job(conn, job["batch_job_id"], imported_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    if not args.dry_run:
+        update_batch_job(conn, job["batch_job_id"], imported_at=time.strftime("%Y-%m-%d %H:%M:%S"))
 
-    print(f"Imported job '{args.job_name}': {records_seen} record(s) read, "
-          f"{completed} document(s) complete, {errored} document(s) errored.")
+    verb = "Would import" if args.dry_run else "Imported"
+    print(f"{tag}{verb} job '{args.job_name}': {records_seen} record(s) read, "
+          f"{completed} document(s) complete, {errored} document(s) errored"
+          + (f", {integrity_errors} skipped (database integrity error)" if integrity_errors else "")
+          + ".")
     conn.close()
 
 
@@ -690,6 +756,56 @@ def cmd_cancel(args):
 
 
 # ===========================================================================
+# cleanup
+# ===========================================================================
+
+def cmd_cleanup(args):
+    conn = get_connection()
+    job = get_batch_job(conn, args.job_name)
+    if not job:
+        print(f"No batch job named '{args.job_name}'.", file=sys.stderr)
+        sys.exit(1)
+
+    if job["status"] in ACTIVE_STATUSES:
+        print(f"Job '{args.job_name}' is still '{job['status']}' on AWS -- refusing to clean up an "
+              f"in-progress job. `cancel` it first (which also stops it), or wait for it to finish.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    tag = "[DRY RUN] " if args.dry_run else ""
+    s3 = None
+
+    if not args.keep_local:
+        work_dir = Path(args.work_dir) / job["run_name"] / job["job_name"]
+        if work_dir.exists():
+            print(f"{tag}Removing local directory: {work_dir}")
+            if not args.dry_run:
+                shutil.rmtree(work_dir)
+        else:
+            print(f"Local directory already gone: {work_dir}")
+
+    for label, keep, uri_field in (
+        ("input", args.keep_s3_input, "s3_input_uri"),
+        ("output", args.keep_s3_output, "s3_output_uri"),
+    ):
+        if keep:
+            continue
+        uri = job[uri_field]
+        if not uri:
+            print(f"No S3 {label} URI recorded for this job -- nothing to remove.")
+            continue
+        if s3 is None:
+            s3 = boto3.client("s3", region_name=args.region)
+        bucket, prefix = parse_s3_uri(uri)
+        keys = list(list_s3_objects(s3, bucket, prefix))
+        print(f"{tag}Removing {len(keys)} S3 {label} object(s): {uri}")
+        if not args.dry_run and keys:
+            delete_s3_keys(s3, bucket, keys)
+
+    conn.close()
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 
@@ -705,6 +821,7 @@ examples:
   %(prog)s status --job-name v1-20260814
   %(prog)s import --job-name v1-20260814
   %(prog)s cancel --job-name v1-20260814
+  %(prog)s cleanup --job-name v1-20260814
   %(prog)s list-jobs -r v1
         """,
     )
@@ -742,10 +859,15 @@ examples:
     p_submit = sub.add_parser("submit", help="Upload staged .jsonl file(s) to S3 and create the Bedrock job.")
     p_submit.add_argument("--job-name", help="Job to submit. Defaults to the most recent 'preparing' job for --run-name.")
     p_submit.add_argument("-r", "--run-name", help="Used to find the job if --job-name is omitted.")
-    p_submit.add_argument("--model-id", required=True, help="Bedrock model ID or ARN to run the job against.")
-    p_submit.add_argument("--s3-bucket", required=True)
+    p_submit.add_argument("--model-id", default=DEFAULT_BEDROCK_MODEL_ID,
+                           help="Bedrock model ID or ARN to run the job against "
+                                "(default: BEDROCK_MODEL_ID from .env).")
+    p_submit.add_argument("--s3-bucket", default=DEFAULT_BEDROCK_S3_BUCKET,
+                           help="(default: BEDROCK_S3_BUCKET from .env)")
     p_submit.add_argument("--s3-prefix", default="docfeatures-batch")
-    p_submit.add_argument("--role-arn", required=True, help="IAM service role ARN (see README for required policy).")
+    p_submit.add_argument("--role-arn", default=DEFAULT_BEDROCK_ROLE_ARN,
+                           help="IAM service role ARN, see README for required policy "
+                                "(default: BEDROCK_ROLE_ARN from .env).")
     p_submit.add_argument("--region", help="AWS region (default: boto3's normal resolution chain).")
     p_submit.add_argument("--timeout-hours", type=int, default=24, help="24-168 (default: %(default)s).")
     p_submit.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
@@ -765,9 +887,15 @@ examples:
     p_import.add_argument("--job-name", required=True)
     p_import.add_argument("--region")
     p_import.add_argument("--force", action="store_true", help="Re-import a job that was already imported.")
-    p_import.add_argument("-v", "--verbose", action="store_true",
-                           help="Print each successfully-imported document's merged feature values "
-                                "as they're written, same style as docfeatures.py's progress line.")
+    p_import.add_argument("-v", "--verbose", action="count", default=0,
+                           help="Print each successfully-imported document's merged feature values as "
+                                "they're written, same style as docfeatures.py's progress line. Repeat "
+                                "(-vv) to also print per-record parse/validation errors as they're found, "
+                                "not just counted in the final summary.")
+    p_import.add_argument("--dry-run", action="store_true",
+                           help="Parse and print the job's output (implies -vv) without writing anything "
+                                "to the database -- view results before committing to a real import. "
+                                "Ignores --force's guard since nothing is changed.")
     p_import.set_defaults(func=cmd_import)
 
     p_cancel = sub.add_parser("cancel", help="Stop the job (if active) and return its documents to the pending pool.")
@@ -775,10 +903,35 @@ examples:
     p_cancel.add_argument("--region")
     p_cancel.set_defaults(func=cmd_cancel)
 
+    p_cleanup = sub.add_parser(
+        "cleanup", help="Delete a job's local staged .jsonl file(s) and/or S3 input/output objects.",
+    )
+    p_cleanup.add_argument("--job-name", required=True)
+    p_cleanup.add_argument("--region")
+    p_cleanup.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
+    p_cleanup.add_argument("--keep-local", action="store_true", help="Don't delete the local staged .jsonl directory.")
+    p_cleanup.add_argument("--keep-s3-input", action="store_true", help="Don't delete the job's S3 input objects.")
+    p_cleanup.add_argument("--keep-s3-output", action="store_true", help="Don't delete the job's S3 output objects.")
+    p_cleanup.add_argument("--dry-run", action="store_true", help="Report what would be deleted without deleting.")
+    p_cleanup.set_defaults(func=cmd_cleanup)
+
     args = parser.parse_args()
 
-    if args.command == "submit" and not args.job_name and not args.run_name:
-        parser.error("submit requires --job-name or --run-name.")
+    if args.command == "submit":
+        if not args.job_name and not args.run_name:
+            parser.error("submit requires --job-name or --run-name.")
+        missing = [
+            flag for flag, val in [
+                ("--model-id", args.model_id),
+                ("--s3-bucket", args.s3_bucket),
+                ("--role-arn", args.role_arn),
+            ] if not val
+        ]
+        if missing:
+            parser.error(
+                f"Missing {', '.join(missing)}. Pass on the command line, or set "
+                f"BEDROCK_MODEL_ID/BEDROCK_S3_BUCKET/BEDROCK_ROLE_ARN in .env."
+            )
 
     try:
         args.func(args)
