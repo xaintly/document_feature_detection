@@ -177,6 +177,15 @@ retries for out-of-options enum values (`--chunk-retry-max-attempts`, default 20
 `--temperature > 0` — deterministic temperature-0 output won't change on retry, so `max_attempts` is
 forced to 1 regardless of the flag in that case.
 
+`call_llm(..., api_key=None)` sends `Authorization: Bearer <api_key>` when set — for commercial
+OpenAI-compatible endpoints (OpenAI itself, or any other hosted provider using the same shape), not just
+local servers. Resolved as `args.api_key or DEFAULT_API_KEY` (`DEFAULT_API_KEY = os.environ.get("API_KEY")`)
+in `process_corpus` — deliberately **not** also readable from the YAML `llm:` config the way
+`host`/`model`/`temperature` are, since that config is persisted verbatim into `runs.config_yaml` and can
+be displayed back (e.g. `docfeatures_web.py`); routing a secret through it would mean storing it in the
+DB. If you're adding config-driven settings elsewhere, this is the pattern to follow for anything
+secret-shaped: CLI flag + env var, never through the YAML config.
+
 ### AWS Bedrock batch path (docfeatures_batch.py)
 
 Alternative to the sync loop above, sharing `lib/docfeatures_lib.py` for everything except the actual LLM

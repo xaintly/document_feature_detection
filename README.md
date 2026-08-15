@@ -168,6 +168,22 @@ llm:
   model: "qwen3.5-35b-long"
 ```
 
+### Commercial / hosted endpoints
+
+The same OpenAI-compatible `/v1/chat/completions` shape works for hosted providers, not just local
+servers — including OpenAI itself. Pass `--api-key` (or set `API_KEY` in `.env`) and it's sent as
+`Authorization: Bearer <key>`:
+
+```bash
+python docfeatures.py --host https://api.openai.com -m gpt-5 --api-key sk-... ...
+```
+
+`--api-key` is deliberately **not** settable from the YAML config the way `--host`/`--model` are — that
+config gets stored verbatim in the database (`runs.config_yaml`) and can be displayed back (e.g. via
+`docfeatures_web.py`), so routing a secret through it would mean persisting it in the DB. Use `--api-key`
+or `.env` only. Local servers that don't expect an `Authorization` header are unaffected — the header is
+simply omitted when no key is configured.
+
 ## Model Selection Notes
 
 Model recommendations change rapidly. Some general guidance as of early 2026:

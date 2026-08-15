@@ -61,6 +61,13 @@ from lib.docfeatures_lib import (
 # ---------------------------------------------------------------------------
 DEFAULT_LLM_HOST = os.environ.get("DEFAULT_LLM_HOST", "http://127.0.0.1:11433")
 DEFAULT_LLM_MODEL = os.environ.get("DEFAULT_LLM_MODEL", "default")
+# Bearer token for commercial OpenAI-compatible endpoints (OpenAI itself, or
+# any other hosted provider using the same API shape). Deliberately NOT
+# readable from the YAML feature config (unlike host/model/temperature) --
+# that config gets persisted verbatim into runs.config_yaml and can be
+# displayed back (e.g. via docfeatures_web.py), so routing a secret through
+# it would mean storing it in the database. --api-key / API_KEY only.
+DEFAULT_API_KEY = os.environ.get("API_KEY")
 # Default for --chunk-retry-max-attempts: how many times to re-roll a chunk
 # when the LLM returns an enum value outside its declared options. Only
 # applies when --temperature > 0 (a temperature-0 model is deterministic, so
@@ -99,7 +106,7 @@ class LLMServerDead(Exception):
     pass
 
 
-def call_llm(host, model, prompt, temperature=0.0, halt_on_conn_failure=False):
+def call_llm(host, model, prompt, temperature=0.0, halt_on_conn_failure=False, api_key=None):
     """Send prompt to llama-server with retry on transient errors.
 
     - 502/503: server restarting → retry up to RETRY_MAX_ATTEMPTS
@@ -108,6 +115,12 @@ def call_llm(host, model, prompt, temperature=0.0, halt_on_conn_failure=False):
       Pass halt_on_conn_failure=True to instead raise LLMServerDead on the
       first failure (--halt-on-conn-failure).
     - Other HTTP errors: raise normally (per-document error)
+
+    api_key, if given, is sent as `Authorization: Bearer <api_key>` -- for
+    commercial OpenAI-compatible endpoints (OpenAI itself, or any other
+    hosted provider using the same API shape) that require it. Local
+    servers (ollama/vLLM/llama-server) typically ignore the header if sent,
+    but api_key is None by default so it's simply omitted for them.
     """
     url = f"{host.rstrip('/')}/v1/chat/completions"
     payload = {
@@ -116,13 +129,14 @@ def call_llm(host, model, prompt, temperature=0.0, halt_on_conn_failure=False):
         "temperature": temperature,
         # "max_completion_tokens": 2048,
     }
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         if _interrupted:
             raise KeyboardInterrupt
 
         try:
-            resp = requests.post(url, json=payload, timeout=600)
+            resp = requests.post(url, json=payload, headers=headers, timeout=600)
         except requests.exceptions.ConnectionError as e:
             if not halt_on_conn_failure and attempt < RETRY_MAX_ATTEMPTS:
                 print(
@@ -188,6 +202,8 @@ def process_corpus(args, config):
         args.temperature if args.temperature is not None
         else config.get("llm", {}).get("temperature", 0.0)
     )
+    # Deliberately not readable from the YAML config -- see DEFAULT_API_KEY.
+    api_key = args.api_key or DEFAULT_API_KEY
 
     conn = get_connection()
 
@@ -302,6 +318,7 @@ def process_corpus(args, config):
                     raw = call_llm(
                         host, model, prompt, temperature,
                         halt_on_conn_failure=args.halt_on_conn_failure,
+                        api_key=api_key,
                     )
                     parsed = parse_json_response(raw)
                     try:
@@ -484,6 +501,13 @@ examples:
         help="LLM sampling temperature (default: 0.0, or from config's "
              "llm.temperature). Use >0 to check agreement across repeated "
              "runs of the same model.",
+    )
+    parser.add_argument(
+        "--api-key", default=DEFAULT_API_KEY,
+        help="Bearer token for commercial OpenAI-compatible endpoints (OpenAI, or any other "
+             "hosted provider using the same API shape). Sent as 'Authorization: Bearer <key>'. "
+             "Default: API_KEY from .env. Not settable via the YAML config, since that gets "
+             "stored in the database (runs.config_yaml) -- use --api-key or .env only.",
     )
     parser.add_argument(
         "--halt-on-conn-failure", action="store_true",
