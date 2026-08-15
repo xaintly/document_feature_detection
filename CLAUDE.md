@@ -198,6 +198,16 @@ call. Lifecycle: `prepare` (offline, no AWS calls) → `submit` → `status` (po
 - Because `get_finished_paths()` (shared lib) treats `batch_pending` as claimed, the sync tool and a
   second `prepare` (same or different run) won't re-stage a file that's already inside an unresolved
   batch job — this is what prevents double-processing across the two tools or concurrent batches.
+  `get_finished_paths(conn, run_name, retry_errors=...)` — pass `args.retry_errors` straight through, no
+  extra negation. It used to be named `include_errors` and be called via a `skip_errors = not
+  args.retry_errors` intermediate at both call sites; that negation was backwards (confirmed against the
+  very first commit — pre-existing, not introduced by any batch-tool work) and meant `docfeatures.py
+  --retry-errors` had *never* worked as documented: errors were retried every run by default, and
+  explicitly passing `--retry-errors` actually suppressed retrying them. Fixed in both
+  `docfeatures.py` and `docfeatures_batch.py prepare` (which gained a `--retry-errors` flag it didn't have
+  before — needed because `import` marks failed documents `'error'`, not `'batch_pending'`, so `cancel`'s
+  cleanup (which only deletes `'batch_pending'` rows) can't return them to the pool once a job's been
+  imported).
 - **`submit`** uploads `prepare`'s staged `.jsonl` file(s) to S3 and calls `create_model_invocation_job`.
   Model selection happens here, not in `prepare` — Converse's whole point is a model-agnostic payload, so
   nothing about the staged records is model-specific. `--model-id` sometimes needs to be a cross-region
@@ -214,23 +224,30 @@ call. Lifecycle: `prepare` (offline, no AWS calls) → `submit` → `status` (po
   A document missing any chunk (errored record, or a `PartiallyCompleted` job that never got to it) is
   marked `'error'` instead; there's no post-hoc retry. Idempotency guard is `batch_jobs.imported_at`
   (not `status`, which stays Bedrock's own value so `status` can still be re-checked after import) —
-  `import --force` re-runs it.
+  `import --force` re-runs it. `import --verbose` (`-v`) prints each successfully-completed document's
+  merged feature values as they're written, in the same `fmt_feature_value`-formatted style as
+  `docfeatures.py`'s own progress line (`fmt_feature_value` lives in `lib/docfeatures_lib.py` now,
+  shared by both) — only on success; errored documents still aren't printed per-document, only counted.
 - **`cancel`** calls `stop_model_invocation_job` if the job is still AWS-active, then unconditionally
   `DELETE`s the `document_runs` rows tied to that `batch_job_id` (FK cascade cleans up any partial
   `chunk_results`), returning those files to the pending pool, and sets `batch_jobs.status='cancelled'`
   (a local-only terminal state, distinct from Bedrock's own `Stopped`). This is the same path whether the
   job was never submitted, is still running, or failed on AWS — the "return files to the pool" ask this
   feature was built around.
-- `prepare` disables thinking by default (`thinking: {type: disabled}`, forced in regardless of
-  `llm.additional_model_request_fields`) — batch is one shot per chunk with no retry, and
-  `merge_chunk_results` discards reasoning tokens anyway, so there's no upside to paying for them.
-  `--enable-thinking` suppresses that forced injection (required for adaptive-thinking-only Claude models,
-  which reject an explicit `disabled` with a 400 — see README). `query_bedrock.py` makes the opposite
-  choice (thinking on by default, `--disable-thinking` to turn it off) since seeing the reasoning is often
-  the point of a one-off exploratory query. Reasoning control itself
-  (`llm.additional_model_request_fields` passthrough into Converse's `additionalModelRequestFields`) is
-  generic rather than a hardcoded per-model table — deliberate, since Bedrock hosts many model families
-  with their own reasoning-control conventions and AWS ships new models often.
+- `prepare --disable-thinking` sets `thinking: {type: disabled}`. **Opt-in, off by default** — this
+  briefly defaulted to *on* (batch is one-shot per chunk with no retry, and `merge_chunk_results` discards
+  reasoning tokens anyway, so disabling looked like a pure win), but real usage found Bedrock Batch's
+  Converse validation rejecting the field outright (`extraneous key [thinking] is not permitted`) for a
+  model that accepts the identical field fine via a live `query_bedrock.py` invoke — i.e. batch's Converse
+  support is not a strict superset of live Converse's, at least not for this field, and a payload that
+  validates live is not proof it'll be accepted by a real batch job. Reverted to opt-in given a forced
+  default can silently fail 100% of a job's records. `query_bedrock.py` has always defaulted the other way
+  (thinking on, `--disable-thinking` to turn off) since seeing the reasoning is usually the point of a
+  one-off query — the two tools' defaults no longer match by design, not by oversight. Reasoning control
+  itself (`llm.additional_model_request_fields` passthrough into Converse's `additionalModelRequestFields`)
+  stays generic rather than a hardcoded per-model table — Bedrock hosts many model families with their own
+  reasoning-control conventions and AWS ships new models often; a table would rot and wouldn't have caught
+  this failure mode anyway since it's a batch-vs-live inconsistency, not a per-model difference.
 
 ### Web app (docfeatures_web.py)
 

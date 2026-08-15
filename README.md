@@ -271,6 +271,7 @@ python docfeatures_batch.py status --job-name v1-20260814
 
 # 4. Once Completed/PartiallyCompleted, pull results into MySQL
 python docfeatures_batch.py import --job-name v1-20260814
+python docfeatures_batch.py import --job-name v1-20260814 --verbose   # also print each document's feature values as they're written
 
 # List locally-known jobs (no AWS call)
 python docfeatures_batch.py list-jobs -r v1
@@ -331,19 +332,28 @@ with `query_bedrock.py` first.
 
 ### Model "thinking" / reasoning
 
-`prepare` sets `additionalModelRequestFields.thinking={type: disabled}` **by default**. Batch gives each
-chunk exactly one shot with no retry loop, and any reasoning/chain-of-thought tokens are discarded by
-`merge_chunk_results` regardless — so there's no upside to paying for them in a batch run (they're still
-worth seeing for one-off exploratory prompts, which is what `query_bedrock.py` is for, and it defaults to
-leaving thinking on).
+`prepare --disable-thinking` sets `additionalModelRequestFields.thinking={type: disabled}`. **Off by
+default** — reasoning tokens are wasted cost in a batch run (each chunk gets one shot with no retry, and
+`merge_chunk_results` discards them regardless), so disabling looks like a good default in theory, but in
+practice we hit a real case where it broke every record in a live job: Bedrock Batch's Converse validation
+rejected `additionalModelRequestFields.thinking` outright —
+*`Malformed input request: #: extraneous key [thinking] is not permitted`* — for a model
+(`us.anthropic.claude-haiku-4-5-20251001-v1:0`) that accepts the exact same field without complaint via a
+live `query_bedrock.py` invoke. **Batch's Converse implementation is not a strict match for live
+Converse's accepted fields**, at least not for this one, and there's no reliable way to know which models
+are affected ahead of time short of testing.
 
-**Adaptive-thinking-only models reject an explicit `disabled`** (as of this writing: Claude Mythos 5,
-Claude Fable 5, Claude Opus 4.7, Claude Mythos Preview) — they return an HTTP 400 for it, so the default
-will break `prepare` for those specifically. Pass `--enable-thinking` to suppress the forced `disabled`
-injection (needed for those models; also available any time you just want reasoning on). To cap rather
-than fully disable reasoning on an adaptive-only model, combine `--enable-thinking` with
-`llm.additional_model_request_fields` in the feature-config YAML — passed straight through into every
-record's Converse `additionalModelRequestFields`, so it works for any current or future Bedrock
+Given that, treat `--disable-thinking` as something to verify with a small (`-n 100`, the minimum job
+size) real batch test before relying on it for a full run — a successful `query_bedrock.py` invoke with
+the same flag is *not* sufficient proof it'll be accepted by an actual batch job. If a job comes back with
+every record erroring on the same "extraneous key" message, drop `--disable-thinking` and retry (see
+"Cleaning up and retrying" below).
+
+Separately, **adaptive-thinking-only models reject an explicit `disabled`** even via live Converse (as of
+this writing: Claude Mythos 5, Claude Fable 5, Claude Opus 4.7, Claude Mythos Preview) — don't pass
+`--disable-thinking` for those at all. To cap (not fully disable) reasoning on one of those, use
+`llm.additional_model_request_fields` in the feature-config YAML instead — passed straight through into
+every record's Converse `additionalModelRequestFields`, so it works for any current or future Bedrock
 model/provider without this project hardcoding a model-name table:
 
 ```yaml
@@ -354,8 +364,29 @@ llm:
 ```
 
 Bedrock does **not** validate that `modelInput` matches a model's actual schema at submit time — a bad
-thinking config only shows up as a per-record `error` in the job's output. Test with a small `-n`-bounded
-`prepare` + `submit` first, the same iterate-small-first workflow described above for the sync tool.
+config only shows up as a per-record `error` in the job's output, or (as above) an entire failed job.
+
+### Cleaning up and retrying
+
+A job that fails outright (e.g. IAM permissions) or completes with every record errored (e.g. a rejected
+`additionalModelRequestFields` field) leaves its documents claimed and going nowhere on their own. Don't
+run `import` on a job with no usable output — `import` marks every document `'error'`, and unlike
+`cancel`, that status is **not** automatically re-picked-up by a plain `prepare` (see `--retry-errors`
+below). For a fully-failed job, go straight to:
+
+```bash
+python docfeatures_batch.py cancel --job-name <job-name>   # returns its documents to the pending pool
+python docfeatures_batch.py prepare -c features.yaml --corpus /data/notes/ -r v1 -n 100   # re-stage, fixing whatever broke
+python docfeatures_batch.py submit --job-name <new-name> ...
+```
+
+If a job *was* already imported (so its documents are sitting at `status='error'` in `document_runs`,
+not `'batch_pending'` — `cancel` won't touch those), use `prepare --retry-errors` instead to re-stage them
+(same semantics as `docfeatures.py --retry-errors`):
+
+```bash
+python docfeatures_batch.py prepare -c features.yaml --corpus /data/notes/ -r v1 --retry-errors -n 100
+```
 
 ### One-time AWS setup
 
@@ -392,8 +423,10 @@ Trust policy (who can assume this role — replace `{{ACCOUNT_ID}}` and `{{REGIO
 }
 ```
 
-Permissions policy attached to that same role (what it's allowed to do once assumed — replace
-`{{BUCKET}}`):
+Permissions policy attached to that same role — **two statements, both required** (replace `{{BUCKET}}`).
+S3 access alone isn't enough; the service role also has to be allowed to actually call the model, or jobs
+fail partway through with `"Customer doesn't have permissions to invokeModel"` even though S3 upload/
+validation succeeded:
 
 ```json
 {
@@ -404,10 +437,33 @@ Permissions policy attached to that same role (what it's allowed to do once assu
             "Effect": "Allow",
             "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
             "Resource": ["arn:aws:s3:::{{BUCKET}}", "arn:aws:s3:::{{BUCKET}}/*"]
+        },
+        {
+            "Sid": "InvokeModel",
+            "Effect": "Allow",
+            "Action": ["bedrock:InvokeModel"],
+            "Resource": "*"
         }
     ]
 }
 ```
+
+**Figuring out the right `InvokeModel` resource ARN(s)** is the part that's easy to get wrong, and the
+official docs undersell it as "optional... for inference profiles" — but several current Claude models
+*require* an inference profile ID for on-demand/batch use in the first place (see "Testing model access"
+above), which makes this non-optional for them in practice. If `--model-id` is a cross-region inference
+profile (`us.`/`global.`-prefixed), you need the profile's own ARN *and* every regional foundation-model
+ARN it can route to, or the job fails with the permissions error above the moment it tries to actually
+invoke:
+
+```bash
+aws bedrock get-inference-profile --inference-profile-identifier us.anthropic.claude-haiku-4-5-20251001-v1:0
+# returns the profile ARN plus each underlying regional foundation-model ARN -- list all of them
+# as Resource entries in the InvokeModel statement above
+```
+
+If `--model-id` is a bare foundation-model ID instead (no `us.`/`global.` prefix), a single
+`arn:aws:bedrock:{{REGION}}::foundation-model/{{MODEL_ID}}` resource entry is enough.
 
 Copy the resulting role's ARN (`arn:aws:iam::{{ACCOUNT_ID}}:role/...`) — that's the `--role-arn` for
 `docfeatures_batch.py submit`.

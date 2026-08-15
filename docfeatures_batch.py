@@ -71,6 +71,7 @@ from lib.docfeatures_lib import (
     discover_files,
     file_hash,
     filter_pending,
+    fmt_feature_value,
     get_connection,
     get_filtered_paths,
     get_finished_paths,
@@ -176,12 +177,17 @@ def get_run_config(conn, run_name):
 
 def build_additional_model_request_fields(config, disable_thinking):
     """Merge the config's llm.additional_model_request_fields passthrough
-    with the disable-thinking default (see --enable-thinking to opt out).
-    Generic by design -- Bedrock hosts many model families with their own
-    reasoning-control conventions, so this avoids hardcoding a model-name
-    table that would rot as AWS ships new models (see README for per-model
-    caveats, e.g. adaptive-thinking-only Claude models reject an explicit
-    'disabled')."""
+    with --disable-thinking sugar. Opt-in, off by default: Bedrock Batch's
+    Converse validation has been observed rejecting
+    additionalModelRequestFields.thinking outright ("extraneous key") for a
+    model that accepts the identical field fine via a live converse() call
+    -- so a payload validated with query_bedrock.py is not proof it'll be
+    accepted by a real batch job, and forcing this by default risks a
+    100%-failed run. Generic by design otherwise -- Bedrock hosts many model
+    families with their own reasoning-control conventions, so this avoids
+    hardcoding a model-name table that would rot as AWS ships new models
+    (see README for further per-model caveats, e.g. adaptive-thinking-only
+    Claude models reject an explicit 'disabled' even via live Converse)."""
     fields = config.get("llm", {}).get("additional_model_request_fields") or {}
     fields = apply_disable_thinking(fields, disable_thinking)
     return fields or None
@@ -280,11 +286,7 @@ def cmd_prepare(args):
         sys.exit(1)
 
     temperature = args.temperature if args.temperature is not None else config.get("llm", {}).get("temperature", 0.0)
-    # Thinking is disabled by default for batch: each chunk gets exactly one
-    # shot (no retry loop like the sync tool's), and reasoning tokens are
-    # discarded by merge_chunk_results regardless, so there's no upside to
-    # paying for them. --enable-thinking opts back in.
-    additional_fields = build_additional_model_request_fields(config, not args.enable_thinking)
+    additional_fields = build_additional_model_request_fields(config, args.disable_thinking)
 
     job_name = sanitize_job_name(args.job_name or f"{args.run_name}-{int(time.time())}")
 
@@ -300,8 +302,7 @@ def cmd_prepare(args):
         sys.exit(1)
     batch_job_id = create_batch_job(conn, args.run_name, job_name)
 
-    skip_errors = False
-    finished = get_finished_paths(conn, args.run_name, include_errors=skip_errors)
+    finished = get_finished_paths(conn, args.run_name, retry_errors=args.retry_errors)
 
     corpus_paths = args.corpus
     if not corpus_paths:
@@ -622,8 +623,9 @@ def cmd_import(args):
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT doc_id, file_id, total_chunks FROM document_runs "
-            "WHERE batch_job_id=%s AND status='batch_pending'",
+            "SELECT dr.doc_id, dr.file_id, dr.total_chunks, f.file_path FROM document_runs dr "
+            "JOIN files f ON dr.file_id = f.file_id "
+            "WHERE dr.batch_job_id=%s AND dr.status='batch_pending'",
             (job["batch_job_id"],),
         )
         pending_docs = cur.fetchall()
@@ -643,6 +645,10 @@ def cmd_import(args):
             save_document_features(conn, doc_id, file_id, merged, features_config)
             mark_document(conn, doc_id, "complete")
             completed += 1
+            if args.verbose:
+                feat_str = "  ".join(f"{k}={fmt_feature_value(v)}" for k, v in merged.items())
+                print(f"  [{completed + errored}/{len(pending_docs)}] {Path(row['file_path']).name}  "
+                      f"({total_chunks} chunk{'s' if total_chunks != 1 else ''})  {feat_str}")
         else:
             mark_document(conn, doc_id, "error", error=f"only {len(got)}/{total_chunks} chunks returned by Bedrock")
             errored += 1
@@ -713,12 +719,16 @@ examples:
     p_prepare.add_argument("--model-invocation-type", choices=["Converse", "InvokeModel"], default="Converse",
                             help="Only Converse is currently implemented.")
     p_prepare.add_argument("--temperature", type=float, default=None)
-    p_prepare.add_argument("--enable-thinking", action="store_true",
-                            help="Leave model thinking/reasoning enabled (default: disabled -- batch is a "
-                                 "one-shot call per chunk with no retry, and reasoning tokens are discarded "
-                                 "by merge_chunk_results anyway, so there's no upside to paying for them "
-                                 "here). Use this for adaptive-thinking-only models that reject an explicit "
-                                 "'disabled' (see README), or if you genuinely want the reasoning to run.")
+    p_prepare.add_argument("--disable-thinking", action="store_true",
+                            help="Set additionalModelRequestFields.thinking={type: disabled}. Off by "
+                                 "default -- Bedrock Batch's Converse validation has been observed "
+                                 "rejecting this field outright ('extraneous key') for a model that "
+                                 "accepts it fine via a live query_bedrock.py invoke, so verify with a "
+                                 "small (-n 100) batch test before relying on it for a full run.")
+    p_prepare.add_argument("--retry-errors", action="store_true",
+                            help="Re-stage documents that errored in a previous run (including ones from "
+                                 "a batch job that already ran through `import`). Same semantics as "
+                                 "docfeatures.py --retry-errors.")
     p_prepare.add_argument("--job-name", help="Defaults to '<run-name>-<unix-timestamp>'.")
     p_prepare.add_argument("--batch-min-records", type=int, default=DEFAULT_BATCH_MIN_RECORDS,
                             help="Warn if staged records fall below this (default: %(default)s).")
@@ -755,6 +765,9 @@ examples:
     p_import.add_argument("--job-name", required=True)
     p_import.add_argument("--region")
     p_import.add_argument("--force", action="store_true", help="Re-import a job that was already imported.")
+    p_import.add_argument("-v", "--verbose", action="store_true",
+                           help="Print each successfully-imported document's merged feature values "
+                                "as they're written, same style as docfeatures.py's progress line.")
     p_import.set_defaults(func=cmd_import)
 
     p_cancel = sub.add_parser("cancel", help="Stop the job (if active) and return its documents to the pending pool.")

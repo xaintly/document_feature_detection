@@ -36,6 +36,7 @@ from lib.docfeatures_lib import (
     discover_files,
     file_hash,
     filter_pending,
+    fmt_feature_value,
     get_connection,
     get_finished_paths,
     get_filtered_paths,
@@ -175,18 +176,6 @@ def fmt_duration(secs):
     return f"{h}h {m}m"
 
 
-def fmt_feature_value(v):
-    """Short display string for a feature value."""
-    if isinstance(v, bool):
-        return "Y" if v else "n"
-    if v is None:
-        return "–"
-    s = str(v)
-    if len(s) > 40:
-        return s[:37] + "..."
-    return s
-
-
 # ===========================================================================
 # Main processing loop
 # ===========================================================================
@@ -207,8 +196,7 @@ def process_corpus(args, config):
         get_or_create_run(conn, args.run_name, config, config_hash, host, model, temperature)
         cleanup_incomplete(conn, args.run_name)
 
-    skip_errors = not args.retry_errors
-    finished = get_finished_paths(conn, args.run_name, include_errors=skip_errors)
+    finished = get_finished_paths(conn, args.run_name, retry_errors=args.retry_errors)
 
     # --- Resolve corpus paths: CLI overrides YAML ---
     corpus_paths = args.corpus  # list or None (from action="append")

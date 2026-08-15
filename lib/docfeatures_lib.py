@@ -84,16 +84,21 @@ def cleanup_incomplete(conn, run_name):
             )
 
 
-def get_finished_paths(conn, run_name, include_errors=False):
-    """Return set of file_paths already finished or claimed for this run.
+def get_finished_paths(conn, run_name, retry_errors=False):
+    """Return set of file_paths already finished or claimed for this run --
+    i.e. NOT eligible to be picked up as pending again.
 
-    Skips 'complete' always, 'batch_pending' always (claimed by a Bedrock
+    Always excludes 'complete' and 'batch_pending' (claimed by a Bedrock
     batch job that hasn't been imported or cancelled yet — prevents the
     sync tool and a batch `prepare` from double-claiming the same file, and
-    two concurrent batch preps from double-claiming each other's files),
-    and 'error' unless retrying.
+    two concurrent batch preps from double-claiming each other's files) from
+    the pending pool. 'error' is excluded too (left un-retried) unless
+    retry_errors is True, in which case errored documents are left OUT of
+    this "finished" set so they come back as pending. Pass
+    retry_errors=args.retry_errors directly -- no extra negation, so as not
+    to repeat the sign-inversion bug this parameter used to have.
     """
-    statuses = "('complete','batch_pending')" if include_errors else "('complete','error','batch_pending')"
+    statuses = "('complete','batch_pending')" if retry_errors else "('complete','error','batch_pending')"
     with conn.cursor() as cur:
         cur.execute(
             "SELECT f.file_path FROM document_runs dr "
@@ -881,6 +886,23 @@ def file_hash(path):
         for block in iter(lambda: f.read(65536), b""):
             h.update(block)
     return h.hexdigest()
+
+
+# ===========================================================================
+# Formatting helpers
+# ===========================================================================
+
+def fmt_feature_value(v):
+    """Short display string for a feature value. Shared by docfeatures.py's
+    per-document progress line and docfeatures_batch.py's `import --verbose`."""
+    if isinstance(v, bool):
+        return "Y" if v else "n"
+    if v is None:
+        return "–"
+    s = str(v)
+    if len(s) > 40:
+        return s[:37] + "..."
+    return s
 
 
 # ===========================================================================
