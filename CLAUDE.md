@@ -53,6 +53,8 @@ python docfeatures_batch.py list-jobs -r v1
 # post-processing
 python docfeatures_dedupe.py --run-name v1 --dry-run     # find/merge byte-identical duplicate documents
 python docfeatures_fix_paths.py --dry-run                 # repair files.file_path rows with stale on-disk casing
+python docfeatures_validate_report.py --backfill          # one-time: recover pre-existing error data into validation_failures
+python docfeatures_validate_report.py -r v1                # classified report on why chunks fail validation
 
 # web UI
 python docfeatures_web.py                                 # dev server
@@ -154,6 +156,14 @@ runs (run_name) ──< document_runs                            │
 - `batch_jobs` tracks AWS Bedrock batch job lifecycle (see next section). Its `status` column is a plain
   `VARCHAR`, not a MySQL `ENUM` — it stores Bedrock's own status strings verbatim, which aren't ours to
   constrain a schema to.
+- `validation_failures` logs every rejected chunk-validation attempt (see `log_validation_failure()` in
+  the Pipeline section below), for `docfeatures_validate_report.py` to analyze. Its `doc_id` column is
+  **deliberately not a foreign key** — every other `doc_id` column in this schema cascades from
+  `document_runs(doc_id)`, but `upsert_document()` deletes and recreates that row (under a new `doc_id`)
+  every time a file is reprocessed, so a cascading FK here would erase this table's history at exactly
+  the moment reprocessing happens — the one case this table exists to survive. `file_id`/`run_name` are
+  real FKs instead (both stable across reprocessing); `doc_id` is kept as an informational column only,
+  and may point at a document_runs row that no longer exists.
 - `docfeatures_initdb.py --migrate` converts an older single-`documents`-table schema (file identity and
   run status combined in one row) into the current `files`/`document_runs` split. It's idempotent —
   `detect_schema_state()` classifies the DB as fresh/legacy/migrated/partial and each of the 9 migration
@@ -193,6 +203,16 @@ blind-reroll-style attempts stopped making sense once each attempt got smarter. 
 multi-turn conversation (no fake assistant turn appended to `messages`) — the correction is folded into
 one user-turn prompt string via `build_prompt(..., correction=...)`, so `call_llm()`'s single-message
 payload shape didn't need to change.
+
+`validate_enum_values()` raises `EnumValidationError` (a `ValueError` subclass, same `str()` output as
+before) instead of a plain `ValueError`, carrying `.feature_name`/`.invalid_value`/`.options` as real
+attributes. Two consumers rely on that instead of regex-parsing the message: the corrective-retry prompt
+builder, and `log_validation_failure()` (writes one `validation_failures` row per rejected attempt,
+skipped in `--dry-run`) — the whole reason for the structured exception was to avoid writing a regex to
+parse a string this same function had just formatted two lines above. Every attempt gets logged, not just
+terminal failures, specifically *because* most attempts now get corrected and never become a
+`document_runs.error_message` at all — see "Diagnosing recurring validation failures" in the README and
+`docfeatures_validate_report.py` below.
 
 `call_llm(..., api_key=None)` sends `Authorization: Bearer <api_key>` when set — for commercial
 OpenAI-compatible endpoints (OpenAI itself, or any other hosted provider using the same shape), not just
@@ -355,6 +375,21 @@ code. `MAX_PREVIEW_BYTES` (2MB) caps in-browser document preview.
   (file removed from the corpus entirely — unrelated) or more than one case-insensitive match (an
   unresolved true duplicate, needs manual attention). `--corpus-base` defaults to `CORPUS_BASE_PATH` from
   `.env` — the same env var `docfeatures_web.py` already uses to resolve stored paths for preview/export.
+- `docfeatures_validate_report.py` — reads `validation_failures` (see Database schema above) and
+  classifies each invalid value against the run's own `runs.config_yaml` feature schema rather than just
+  listing raw strings: `own_near_miss` (fuzzy-close to one of the feature's own valid options — a
+  validator/formatting issue, not a prompt one; uses stdlib `difflib`, no new dependency),
+  `other_enum_value` (exact match to a different enum feature's option — features are confusable),
+  `other_field_name`/`modified_field_name` (matches or resembles another feature's YAML key, the latter
+  via a small prefix/suffix-stripping heuristic plus a `difflib` ratio cutoff — catches things like
+  `has_lung_cancer` → `lung_cancer`), or `novel` (unattributed — the strongest signal an enum is missing a
+  legitimate catch-all option). `--backfill` recovers what's still recoverable from
+  `document_runs.error_message` for runs/documents that predate this table; idempotent via checking for an
+  existing `source='backfill'` row per `doc_id` before inserting. `parse_legacy_error_message()`'s regex
+  is unanchored, so it only matches enum-validation messages and correctly ignores other
+  `document_runs.error_message` shapes (JSON-parse failures, HTTP errors, connection errors) rather than
+  misclassifying them — verified directly against production `error_message` data (~98% match rate; the
+  ~2% non-matches were confirmed to be exactly those other error types, not parsing failures).
 - `query.py` — standalone ad hoc CLI for querying an Ollama model directly (prompt/system/image
   attachment/temperature/context). Not part of the docfeatures data pipeline or schema.
 

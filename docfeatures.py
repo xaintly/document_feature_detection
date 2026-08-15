@@ -30,6 +30,7 @@ import yaml
 
 from lib.docfeatures_lib import (
     CHUNK_TARGET_CHARS,
+    EnumValidationError,
     build_chunks,
     build_correction_note,
     build_prompt,
@@ -45,6 +46,7 @@ from lib.docfeatures_lib import (
     get_or_create_run,
     list_runs_db,
     load_and_validate_config,
+    log_validation_failure,
     mark_document,
     merge_chunk_results,
     parse_json_response,
@@ -331,6 +333,18 @@ def process_corpus(args, config):
                         parsed = parse_json_response(raw)
                         validate_enum_values(parsed, features_config, chunk_info)
                     except ValueError as e:
+                        if not args.dry_run and isinstance(e, EnumValidationError):
+                            # Log every rejected attempt, not just ones a
+                            # document ultimately fails on -- most of these
+                            # will get corrected below and never touch
+                            # document_runs.error_message at all, but they're
+                            # exactly what docfeatures_validate_report.py needs
+                            # to see to find patterns in *why* the model
+                            # picked an invalid value in the first place.
+                            log_validation_failure(
+                                conn, args.run_name, file_id, doc_id, ci, e.feature_name,
+                                e.invalid_value, str(e), attempt,
+                            )
                         if max_attempts == 1:
                             raise e
                         elif attempt == max_attempts:

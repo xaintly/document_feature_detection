@@ -251,6 +251,46 @@ docfeatures handles LLM server instability:
 - **Thermal throttling (compact hardware):** Use `--cooldown 3` to inject pauses between documents, reducing sustained heat load on devices like the NVIDIA DGX Spark.
 - **Malformed JSON or an invalid enum value:** the chunk is retried up to `--chunk-retry-max-attempts` times (default 3) — but not by resending an identical prompt and hoping for a different roll. Each retry tells the model what it answered and specifically why that was rejected, and asks for a correction. Because the retry prompt is different from the original (not just resampled), this works the same regardless of `--temperature`, including the default of 0. Set `--chunk-retry-max-attempts 1` to disable retrying entirely — useful if you're studying the model's raw first-attempt failure rate rather than triaging around it.
 
+### Diagnosing recurring validation failures
+
+Because most rejected chunks now get corrected on retry, they no longer show up as a document-level
+error — which is good for throughput, but means `document_runs.error_message` stops being a useful place
+to look for *patterns* in why the model picks invalid enum values. Every rejected attempt (corrected or
+not) is instead logged to a `validation_failures` table as it happens.
+
+`docfeatures_validate_report.py` reads that table and classifies each invalid value against the run's own
+feature schema, instead of just listing raw strings and counts:
+
+```bash
+python docfeatures_validate_report.py --run-name v3
+python docfeatures_validate_report.py --run-name v3 --feature malignancy_likelihood --top 20 --examples 3
+```
+
+Each invalid value is bucketed into one of:
+- **near-miss of its own valid options** — a formatting/validator issue (whitespace, casing, singular vs.
+  plural), not a prompt problem.
+- **matches an option from a different enum feature** — the model is confusing two features; consider
+  clarifying the prompt or separating them.
+- **matches (or closely resembles) another feature's name** — often a boolean feature's key name leaking
+  into an enum answer, usually because too many similarly-shaped features are crammed into one prompt.
+- **novel** — not traceable to anything else in the schema. This is the strongest signal that an enum is
+  missing a legitimate option (e.g. no `none`/`n/a`/`unclear` catch-all for documents where the feature
+  genuinely doesn't apply).
+
+For runs (or documents) that predate this table — or where a document's `error_message` got overwritten
+by a later successful reprocessing — recover what's still recoverable from `document_runs.error_message`
+with `--backfill` (idempotent, safe to re-run):
+
+```bash
+python docfeatures_validate_report.py --backfill              # all runs
+python docfeatures_validate_report.py --backfill --run-name v3
+```
+
+Backfill can only recover documents that *never* got corrected on retry (i.e. still `status='error'`) —
+it has no way to know about attempts that failed and then succeeded, since that was never persisted
+anywhere before this table existed. Run it before reprocessing/retrying old errors if you want to keep
+that history, since a successful reprocess overwrites `error_message`.
+
 ## Batch Processing (AWS Bedrock)
 
 For large corpora, `docfeatures_batch.py` is an alternative to the synchronous `docfeatures.py` loop: it

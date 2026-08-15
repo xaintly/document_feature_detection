@@ -405,6 +405,24 @@ def mark_document(conn, doc_id, status, elapsed=None, error=None):
         )
 
 
+def log_validation_failure(conn, run_name, file_id, doc_id, chunk_index, feature_name,
+                            invalid_value, error_message, attempt, source="live"):
+    """Append a durable record of a rejected chunk-validation attempt, for
+    docfeatures_validate_report.py to analyze later. Deliberately append-only
+    and NOT tied to doc_id by foreign key (see the schema comment in
+    docfeatures_initdb.py) -- this table's whole purpose is to survive a
+    document being reprocessed, which deletes and recreates its
+    document_runs row (and would cascade away anything FK'd to it)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO validation_failures "
+            "(run_name, file_id, doc_id, chunk_index, feature_name, invalid_value, "
+            "error_message, attempt, source) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (run_name, file_id, doc_id, chunk_index, feature_name,
+             str(invalid_value), error_message, attempt, source),
+        )
+
+
 def list_runs_db(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -766,26 +784,44 @@ def parse_json_response(raw):
 # Feature Merging (across chunks)
 # ===========================================================================
 
+class EnumValidationError(ValueError):
+    """Raised by validate_enum_values when an enum feature's value isn't one
+    of its declared options. A ValueError subclass with the exact same
+    str() output as before (so `raise ValueError(f"Chunk retries limit "
+    f"exceeded: {e}")`-style wrapping and any existing string matching
+    against it are unaffected), but also carries the offending feature name
+    and value as real attributes -- so a corrective retry or a
+    validation_failures log entry doesn't need to regex-parse a message
+    this same codebase just formatted two lines above.
+    """
+    def __init__(self, feature_name, invalid_value, options, chunk_info=None):
+        self.feature_name = feature_name
+        self.invalid_value = invalid_value
+        self.options = options
+        self.chunk_info = chunk_info
+        where = f" (chunk {chunk_info[0]}/{chunk_info[1]})" if chunk_info else ""
+        super().__init__(
+            f"Feature '{feature_name}'{where}: LLM returned {invalid_value!r}, "
+            f"which is not one of the declared options {options}"
+        )
+
+
 def validate_enum_values(parsed, features_config, chunk_info=None):
-    """Raise ValueError if any enum feature in a single chunk's parsed
-    response isn't one of its declared options (case-insensitive). LLMs
-    occasionally hallucinate an option that was never offered; catching it
-    here fails the document fast (before spending more LLM calls on it)
+    """Raise EnumValidationError if any enum feature in a single chunk's
+    parsed response isn't one of its declared options (case-insensitive).
+    LLMs occasionally hallucinate an option that was never offered; catching
+    it here fails the document fast (before spending more LLM calls on it)
     instead of letting merge_chunk_results silently store the made-up
     value. Booleans/text/integers aren't validated -- this hasn't been an
     observed problem for those types.
     """
-    where = f" (chunk {chunk_info[0]}/{chunk_info[1]})" if chunk_info else ""
     for name, fdef in features_config.items():
         if fdef.get("type", "boolean") != "enum" or name not in parsed:
             continue
         value = parsed[name]
         options = fdef.get("options", [])
         if str(value).strip().lower() not in [o.lower() for o in options]:
-            raise ValueError(
-                f"Feature '{name}'{where}: LLM returned {value!r}, which is "
-                f"not one of the declared options {options}"
-            )
+            raise EnumValidationError(name, value, options, chunk_info)
 
 
 def merge_chunk_results(chunk_jsons, features_config):

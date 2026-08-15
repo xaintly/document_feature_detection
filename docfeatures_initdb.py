@@ -180,6 +180,36 @@ TABLES = [
         )
         """,
     ),
+    # doc_id is deliberately NOT a foreign key here (unlike every other
+    # doc_id column in this schema). upsert_document() deletes and
+    # recreates a document_runs row (under a new doc_id) every time a file
+    # is reprocessed -- an ON DELETE CASCADE FK would destroy this table's
+    # whole purpose (surviving reprocessing) at exactly the moment
+    # reprocessing happens. file_id/run_name are stable across
+    # reprocessing, so those are real FKs; doc_id is kept only as an
+    # informational cross-reference that may point at a since-deleted row.
+    (
+        "validation_failures",
+        """
+        CREATE TABLE IF NOT EXISTS validation_failures (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            run_name        VARCHAR(255) NOT NULL,
+            file_id         INT NOT NULL,
+            doc_id          INT,
+            chunk_index     INT,
+            feature_name    VARCHAR(255) NOT NULL,
+            invalid_value   VARCHAR(1024),
+            error_message   TEXT,
+            attempt         INT,
+            source          ENUM('live','backfill') NOT NULL DEFAULT 'live',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_name) REFERENCES runs(run_name)
+                ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(file_id)
+                ON DELETE CASCADE
+        )
+        """,
+    ),
 ]
 
 INDEXES = [
@@ -187,6 +217,7 @@ INDEXES = [
     ("idx_doc_run_status", "document_runs", "(run_name, status)"),
     ("idx_file_hash", "files", "(file_hash)"),
     ("idx_batch_jobs_status", "batch_jobs", "(status)"),
+    ("idx_vf_run_feature", "validation_failures", "(run_name, feature_name)"),
 ]
 
 # Additive columns for existing databases that predate a schema change.
