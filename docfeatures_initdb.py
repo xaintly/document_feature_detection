@@ -73,6 +73,38 @@ TABLES = [
         )
         """,
     ),
+    # status is a plain VARCHAR, not a MySQL ENUM: it stores AWS Bedrock's own
+    # job status strings verbatim (Submitted, Validating, Scheduled,
+    # InProgress, Completed, PartiallyCompleted, Failed, Expired, Stopping,
+    # Stopped -- see docfeatures_batch.py) plus two local-only bookend states
+    # ('preparing' before submit, 'imported'/'cancelled' once we're done with
+    # it). Bedrock's status set isn't ours to lock a DB constraint to.
+    (
+        "batch_jobs",
+        """
+        CREATE TABLE IF NOT EXISTS batch_jobs (
+            batch_job_id    INT AUTO_INCREMENT PRIMARY KEY,
+            run_name        VARCHAR(255) NOT NULL,
+            job_name        VARCHAR(255) NOT NULL,
+            job_arn         VARCHAR(512),
+            model_id        VARCHAR(255),
+            model_invocation_type ENUM('InvokeModel','Converse') DEFAULT 'Converse',
+            s3_input_uri    VARCHAR(1024),
+            s3_output_uri   VARCHAR(1024),
+            role_arn        VARCHAR(512),
+            status          VARCHAR(32) NOT NULL DEFAULT 'preparing',
+            total_records   INT,
+            error_message   TEXT,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            submitted_at    TIMESTAMP NULL,
+            last_checked_at TIMESTAMP NULL,
+            imported_at     TIMESTAMP NULL,
+            UNIQUE KEY uq_job_name (job_name),
+            FOREIGN KEY (run_name) REFERENCES runs(run_name)
+                ON DELETE CASCADE
+        )
+        """,
+    ),
     (
         "document_runs",
         """
@@ -80,8 +112,9 @@ TABLES = [
             doc_id          INT AUTO_INCREMENT PRIMARY KEY,
             run_name        VARCHAR(255) NOT NULL,
             file_id         INT NOT NULL,
+            batch_job_id    INT NULL,
             total_chunks    INT DEFAULT 1,
-            status          ENUM('processing','complete','error')
+            status          ENUM('processing','complete','error','batch_pending')
                                 DEFAULT 'processing',
             error_message   TEXT,
             processing_secs FLOAT,
@@ -90,6 +123,8 @@ TABLES = [
             FOREIGN KEY (run_name) REFERENCES runs(run_name)
                 ON DELETE CASCADE,
             FOREIGN KEY (file_id) REFERENCES files(file_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (batch_job_id) REFERENCES batch_jobs(batch_job_id)
                 ON DELETE CASCADE
         )
         """,
@@ -151,6 +186,7 @@ INDEXES = [
     ("idx_df_feature_value", "document_features", "(feature_name, value_text(128))"),
     ("idx_doc_run_status", "document_runs", "(run_name, status)"),
     ("idx_file_hash", "files", "(file_hash)"),
+    ("idx_batch_jobs_status", "batch_jobs", "(status)"),
 ]
 
 # Additive columns for existing databases that predate a schema change.
@@ -158,6 +194,19 @@ INDEXES = [
 COLUMNS = [
     ("runs", "llm_temperature",
      "ALTER TABLE runs ADD COLUMN llm_temperature FLOAT DEFAULT 0.0 AFTER llm_model"),
+    ("document_runs", "batch_job_id",
+     "ALTER TABLE document_runs ADD COLUMN batch_job_id INT NULL AFTER file_id, "
+     "ADD CONSTRAINT fk_document_runs_batch_job FOREIGN KEY (batch_job_id) "
+     "REFERENCES batch_jobs(batch_job_id) ON DELETE CASCADE"),
+]
+
+# Additive ENUM values for existing databases that predate a schema change.
+# ALTER TABLE ... MODIFY doesn't fit the ADD-COLUMN-shaped COLUMNS list above,
+# so this gets its own idempotent (table, column, value, ALTER statement) list.
+ENUM_ADDITIONS = [
+    ("document_runs", "status", "batch_pending",
+     "ALTER TABLE document_runs MODIFY status "
+     "ENUM('processing','complete','error','batch_pending') DEFAULT 'processing'"),
 ]
 
 
@@ -207,6 +256,21 @@ def column_exists(cursor, table_name, column_name):
         (table_name, column_name),
     )
     return cursor.fetchone() is not None
+
+
+def enum_has_value(cursor, table_name, column_name, value):
+    """Check whether *value* is already a member of a MySQL ENUM column,
+    by inspecting its COLUMN_TYPE (e.g. "enum('a','b','c')")."""
+    cursor.execute(
+        "SELECT COLUMN_TYPE FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() "
+        "AND table_name = %s AND column_name = %s LIMIT 1",
+        (table_name, column_name),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return False
+    return f"'{value}'" in row["COLUMN_TYPE"]
 
 
 def fk_exists(cursor, table_name, column_name, ref_table_name):
@@ -323,6 +387,14 @@ def do_check(db_name):
                 print(f"  ✗ Column '{tname}.{cname}' is missing.")
                 ok = False
 
+        # Check additive ENUM values
+        for tname, cname, value, _ in ENUM_ADDITIONS:
+            if table_exists(cur, tname) and enum_has_value(cur, tname, cname, value):
+                print(f"  ✓ Enum value '{tname}.{cname}' includes '{value}'")
+            elif table_exists(cur, tname):
+                print(f"  ✗ Enum value '{tname}.{cname}' is missing '{value}'.")
+                ok = False
+
     conn.close()
     print()
     if ok:
@@ -385,6 +457,14 @@ def do_init(db_name):
                 print(f"  Column '{tname}.{cname}' — adding...")
                 cur.execute(alter_sql)
                 print(f"  Column '{tname}.{cname}' — added")
+
+        for tname, cname, value, alter_sql in ENUM_ADDITIONS:
+            if enum_has_value(cur, tname, cname, value):
+                print(f"  Enum value '{tname}.{cname}'='{value}' — already exists")
+            else:
+                print(f"  Enum value '{tname}.{cname}'='{value}' — adding...")
+                cur.execute(alter_sql)
+                print(f"  Enum value '{tname}.{cname}'='{value}' — added")
 
     conn.close()
     print()
