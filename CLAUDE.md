@@ -61,8 +61,11 @@ python docfeatures_web.py                                 # dev server
 gunicorn docfeatures_web:app -b 0.0.0.0:5000               # prod-style
 ```
 
-Note: `docfeatures.py --help`'s CLI reference in README.md is out of date — the actual parser also has
-`--dry-run`, `--chunk-size`, and `--temperature`; check `main()` in docfeatures.py, not just the README.
+Docs live in two places: `README.md` covers install/quick-start/feature-type syntax/CLI reference for the
+core pipeline; `docs/*.md` covers everything else (LLM backend compatibility, AWS Bedrock batch,
+database schema, validation/retry behavior, and the standalone tools below) — `README.md`'s own
+"Documentation" section links to each. When editing `docfeatures.py`'s argparse flags, update both
+`main()` and the CLI reference block in README.md — nothing regenerates it automatically.
 
 ## Architecture
 
@@ -150,7 +153,7 @@ runs (run_name) ──< document_runs                            │
 - `document_features.file_id` is denormalized (duplicated from `document_runs`) specifically so "all
   features for this file across every run" doesn't require a join through `document_runs`/`runs` — this
   is what `docfeatures_web.py`'s cross-run views and `docfeatures_dedupe.py`'s tag-merging rely on.
-- `feature_verifications` (not mentioned in README.md) backs the web app's edit/verify mode: a
+- `feature_verifications` (documented in `docs/database-schema.md`, not README.md) backs the web app's edit/verify mode: a
   human-corrected value per (doc_id, feature_name), distinct from the LLM-extracted `document_features`
   value.
 - `batch_jobs` tracks AWS Bedrock batch job lifecycle (see next section). Its `status` column is a plain
@@ -211,8 +214,8 @@ builder, and `log_validation_failure()` (writes one `validation_failures` row pe
 skipped in `--dry-run`) — the whole reason for the structured exception was to avoid writing a regex to
 parse a string this same function had just formatted two lines above. Every attempt gets logged, not just
 terminal failures, specifically *because* most attempts now get corrected and never become a
-`document_runs.error_message` at all — see "Diagnosing recurring validation failures" in the README and
-`docfeatures_validate_report.py` below.
+`document_runs.error_message` at all — see "Diagnosing recurring validation failures" in
+`docs/validation-and-retries.md` and `docfeatures_validate_report.py` below.
 
 `call_llm(..., api_key=None)` sends `Authorization: Bearer <api_key>` when set — for commercial
 OpenAI-compatible endpoints (OpenAI itself, or any other hosted provider using the same shape), not just
